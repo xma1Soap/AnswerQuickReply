@@ -1,0 +1,12 @@
+{
+  "publicBaseUrl": "https://YOUR_DOMAIN/answer-qr",
+  "clientId": "",
+  "clientSecret": "",
+  "guildId": "YOUR_GUILD_ID",
+  "libraryRoleIds": ["YOUR_ANSWER_ROLE_ID"],
+  "botToken": "",
+  "libraryReadsPerHour": 60,
+  "reviewerIds": ["YOUR_DISCORD_USER_ID"],
+  "autoPublishIds": [],
+  "databasePath": "/var/lib/answer-qr/contributions.sqlite3"
+}

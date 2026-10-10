@@ -1,0 +1,26 @@
+# Private local material and build products
+**/.local/
+**/local/
+**/_backup*/
+**/backups/
+**/publish-backups/
+**/node_modules/
+**/__pycache__/
+*.pyc
+*.bak
+*.env
+.env
+.env.*
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.lock
+*.pem
+*.key
+read-token
+contributions.json
+!answer-qr-server/deploy/contributions.example.json
+/work/
+/outputs/
+/dist/

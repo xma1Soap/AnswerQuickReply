@@ -1,0 +1,60 @@
+{
+  "retrieved": "2026-10-09",
+  "runtimeNetwork": "none",
+  "assets": [
+    {
+      "file": "worker.min.js",
+      "project": "Tesseract.js",
+      "version": "6.0.1",
+      "source": "https://registry.npmjs.org/tesseract.js/-/tesseract.js-6.0.1.tgz",
+      "extraction": "package/dist/worker.min.js",
+      "bytes": 111162,
+      "sha256": "38645599043239c0eb6db08a6504a92dcdc292200535f3e9339cd77c4443b842"
+    },
+    {
+      "file": "worker.min.js.map",
+      "project": "Tesseract.js",
+      "version": "6.0.1",
+      "source": "https://registry.npmjs.org/tesseract.js/-/tesseract.js-6.0.1.tgz",
+      "extraction": "package/dist/worker.min.js.map",
+      "bytes": 341644,
+      "sha256": "51ea3f21d9c0ed195e7de3c4ac493dbb208368162f2674aa2286265495ec7377"
+    },
+    {
+      "file": "tesseract-core-lstm.wasm.js",
+      "project": "Tesseract.js core",
+      "version": "6.0.0",
+      "source": "https://registry.npmjs.org/tesseract.js-core/-/tesseract.js-core-6.0.0.tgz",
+      "extraction": "package/tesseract-core-lstm.wasm.js",
+      "bytes": 3954181,
+      "sha256": "775a35df6f2ae100e02609443e6bd5cafcd07983dd6175454ca4a432a7730687"
+    },
+    {
+      "file": "tesseract-core-simd-lstm.wasm.js",
+      "project": "Tesseract.js core",
+      "version": "6.0.0",
+      "source": "https://registry.npmjs.org/tesseract.js-core/-/tesseract.js-core-6.0.0.tgz",
+      "extraction": "package/tesseract-core-simd-lstm.wasm.js",
+      "bytes": 3954569,
+      "sha256": "9d7c43fb206dc9f48475228b46bf35f888fa9e6259da2e67d5a75c77049f2dc7"
+    },
+    {
+      "file": "eng.traineddata.gz",
+      "project": "tessdata_fast",
+      "version": "4.1.0",
+      "source": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/eng.traineddata",
+      "extraction": "gzip level 9, deterministic mtime 0",
+      "bytes": 1962155,
+      "sha256": "b130d16b69e3888bc099133991a50a5b50e1da0e3ff6ca31a5496fab0fb386c3"
+    },
+    {
+      "file": "chi_sim.traineddata.gz",
+      "project": "tessdata_fast",
+      "version": "4.1.0",
+      "source": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/chi_sim.traineddata",
+      "extraction": "gzip level 9, deterministic mtime 0",
+      "bytes": 1722294,
+      "sha256": "6a317f84d100103a0740334e01c3dedbe761a29d946b44a166cb322729094bec"
+    }
+  ]
+}

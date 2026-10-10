@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.local/
+# Secrets, runtime data and private deployment notes never belong in git.
+.env
+*.env
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.lock
+read-token
+contributions.json
+!deploy/contributions.example.json
+backups/
+publish-backups/

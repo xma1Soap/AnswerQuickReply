@@ -1,0 +1,28 @@
+[Unit]
+Description=Answer QR library (Discord role-gated)
+After=network.target
+
+[Service]
+Type=simple
+User=answerqr
+Group=answerqr
+WorkingDirectory=/opt/answer-qr/current
+# Library reads require a Discord login with the configured guild role (see CONTRIBUTIONS.md).
+# Add --public only if you deliberately want anyone to download the whole library.
+ExecStart=/usr/bin/python3 -B /opt/answer-qr/current/server.py --library /var/lib/answer-qr/library.json --port 8765 --contributions-config /etc/answer-qr/contributions.json
+ReadWritePaths=/var/lib/answer-qr
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,3 @@
+# Local backups made during development; may contain machine paths.
+_backup_*/
+*.bak
