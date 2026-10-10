@@ -8,6 +8,7 @@ import { Message, MessageAttachment, RenderModalProps } from "@vencord/discord-t
 import { ChannelStore, closeAllModals, ConfirmModal, MessageActions, Modal, NavigationRouter, openModal, Parser, SelectedChannelStore, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "@webpack/common";
 
 import { errorText, fileToImage, imageAttachments, imageTools, recognizeAttachment } from "./bridge";
+import { CloudUpdate, getContributionState, loadContributionPanel, snapshotContribution, submitContribution } from "./contribute";
 import { openContributions } from "./contributeUi";
 import { Icon, IconName } from "./icons";
 import { matchEntries, normalizeText, QR_LIMITS, QREntry, QRImage, QRMatch, searchEntries } from "./model";
@@ -269,6 +270,18 @@ export function openEditor(entry = blankEntry()) {
     openModal(props => <Editor modalProps={props} entry={entry} />);
 }
 
+async function openCloudEditor(entry: QREntry) {
+    try {
+        const snapshot = snapshotContribution(entry);
+        await loadContributionPanel();
+        const service = getContributionState();
+        if (!service.user) { openContributions(); showQrToast("请先登录，再选择云端条目编辑。"); return; }
+        if (!service.cloudEditing || getRemoteState().config.url !== DEFAULT_REMOTE_URL) throw new Error("当前云端服务不支持直接编辑，请更新服务或切回社区云端。");
+        const update = { targetId: snapshot.id, baseUpdatedAt: snapshot.updatedAt };
+        openModal(props => <Editor modalProps={props} entry={snapshot} cloudUpdate={update} />);
+    } catch (e) { showQrToast(errorText(e), "failure"); }
+}
+
 export async function captureMessage(source: Message | ReplyTarget) {
     try {
         const message = snapshotReplyTarget(source);
@@ -435,7 +448,7 @@ function ImageTray({ images, busy, onAdd, onRemove }: { images: QRImage[]; busy:
     </div>;
 }
 
-function Editor({ modalProps, entry }: { modalProps: RenderModalProps; entry: QREntry; }) {
+function Editor({ modalProps, entry, cloudUpdate }: { modalProps: RenderModalProps; entry: QREntry; cloudUpdate?: CloudUpdate; }) {
     const [draft, setDraft] = useState<QREntry>({ ...entry, images: [...entry.images] });
     const [keywords, setKeywords] = useState<string[]>([...entry.keywords]);
     const [weakKeywords, setWeakKeywords] = useState<string[]>([...entry.weakKeywords]);
@@ -445,7 +458,8 @@ function Editor({ modalProps, entry }: { modalProps: RenderModalProps; entry: QR
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState("");
     const [deleteArmed, setDeleteArmed] = useState(false);
-    const saved = useMemo(() => getEntries().some(e => e.id === entry.id), []);
+    const saved = useMemo(() => !cloudUpdate && getEntries().some(e => e.id === entry.id), []);
+    const savingRef = useRef(false);
     const { length } = draft.content;
     const canSave = !!draft.title.trim() && !!(draft.content.trim() || draft.images.length) && !busy;
 
@@ -467,21 +481,28 @@ function Editor({ modalProps, entry }: { modalProps: RenderModalProps; entry: QR
     }
 
     async function save() {
-        if (saving || !canSave) return;
+        if (savingRef.current || !canSave) return;
+        savingRef.current = true;
         setSaving(true);
         setError("");
         try {
-            await saveEntry({
+            const next = {
                 ...draft,
                 title: draft.title.trim(),
                 keywords: mergeKeywords(keywords, keywordText),
                 weakKeywords: mergeKeywords(weakKeywords, weakText),
-                updatedAt: Date.now()
-            });
+                // Keep cloud retries identical; the server assigns the new version.
+                updatedAt: cloudUpdate ? entry.updatedAt : Date.now()
+            };
+            let notice = "已保存答疑 QR";
+            if (cloudUpdate) {
+                const result = await submitContribution(next, cloudUpdate);
+                notice = result.status === "published" ? "已替换云端 QR" : "修改已提交审核，原云端 QR 保持不变";
+            } else await saveEntry(next);
             modalProps.onClose();
-            showQrToast("已保存答疑 QR", "success");
+            showQrToast(notice, "success");
         } catch (e) { setError(errorText(e)); }
-        finally { setSaving(false); }
+        finally { savingRef.current = false; setSaving(false); }
     }
 
     async function remove() {
@@ -495,11 +516,11 @@ function Editor({ modalProps, entry }: { modalProps: RenderModalProps; entry: QR
     return <Modal
         {...modalProps}
         size="lg"
-        title={saved ? "编辑答疑 QR" : "收录答疑 QR"}
-        subtitle="保存一段图文答复，并设置遇到哪些关键词时推荐它。"
+        title={cloudUpdate ? "编辑云端 QR" : saved ? "编辑答疑 QR" : "收录答疑 QR"}
+        subtitle={cloudUpdate ? "保存后替换原云端条目：白名单直接生效，其他成员的修改通过审核后生效。" : "保存一段图文答复，并设置遇到哪些关键词时推荐它。"}
         actions={[
             { text: "取消", variant: "secondary", onClick: modalProps.onClose },
-            { text: "保存 QR", variant: "primary", onClick: save, loading: saving, disabled: !canSave }
+            { text: cloudUpdate ? "保存到云端" : "保存 QR", variant: "primary", onClick: save, loading: saving, disabled: !canSave || saving }
         ]}
     >
         <div className="aqr-root aqr-editor" onPaste={e => {
@@ -562,7 +583,7 @@ function Editor({ modalProps, entry }: { modalProps: RenderModalProps; entry: QR
             </div>
 
             <div className="aqr-editor-foot">
-                <Switch checked={draft.favorite} onChange={favorite => setDraft({ ...draft, favorite })} icon="star" label="收藏到右键菜单" hint="右键任意消息时直接显示" />
+                {!cloudUpdate && <Switch checked={draft.favorite} onChange={favorite => setDraft({ ...draft, favorite })} icon="star" label="收藏到右键菜单" hint="右键任意消息时直接显示" />}
                 <div className="aqr-editor-foot-end">
                     {draft.sourceUrl && <button type="button" className="aqr-link" onClick={() => openSourceMessage(draft.sourceUrl!)}><Icon name="link" size={14} />收录来源</button>}
                     {saved && <Button variant="danger" size="sm" icon="trash" className={cx("aqr-confirm", deleteArmed && "is-armed")} disabled={saving} onClick={remove}>
@@ -788,7 +809,7 @@ function Library({ modalProps, message, startOcr, initialQuery = "" }: { modalPr
         {...modalProps}
         size="xl"
         title={message ? "选择答疑 QR" : "答疑 QR 库"}
-        subtitle={message ? "按关键词推荐，预览后引用原消息发送。" : "本地库可管理；云端库只读，可预览发送或保存到本地。"}
+        subtitle={message ? "按关键词推荐，预览后引用原消息发送。" : "本地库可管理；社区云端支持编辑、预览发送和导入本地。"}
         actions={[{ text: "关闭", variant: "secondary", onClick: modalProps.onClose }]}
     >
         <div className={cx("aqr-root aqr-library", message && "has-target")}>
@@ -931,10 +952,11 @@ function Library({ modalProps, message, startOcr, initialQuery = "" }: { modalPr
                         sending={sending === selected.id}
                         busy={!!sending || !!copying}
                         readOnly={readOnly}
+                        canEditCloud={readOnly && remote.config.url === DEFAULT_REMOTE_URL}
                         copying={copying === selected.id}
                         onSaveLocal={() => void copyToLocal(selected)}
                         onPrimary={() => primary(selected)}
-                        onEdit={() => openEditor(selected)}
+                        onEdit={() => { if (readOnly) void openCloudEditor(selected); else openEditor(selected); }}
                         onFavorite={() => toggleFavorite(selected)}
                         onDelete={() => remove(selected)}
                     /> : <div className="aqr-detail-empty"><Icon name="layers" size={26} /><span>{visible.length ? "选择一条 QR 预览" : "没有可预览的 QR"}</span></div>}
@@ -1012,6 +1034,7 @@ interface DetailProps {
     sending: boolean;
     busy: boolean;
     readOnly: boolean;
+    canEditCloud: boolean;
     copying: boolean;
     onSaveLocal(): void;
     onPrimary(): void;
@@ -1020,7 +1043,7 @@ interface DetailProps {
     onDelete(): void;
 }
 
-function Detail({ entry, match, message, mention, sending, busy, readOnly, copying, onSaveLocal, onPrimary, onEdit, onFavorite, onDelete }: DetailProps) {
+function Detail({ entry, match, message, mention, sending, busy, readOnly, canEditCloud, copying, onSaveLocal, onPrimary, onEdit, onFavorite, onDelete }: DetailProps) {
     const strong = !!match && match.score >= 100;
     const count = entry.images.length;
     return <article className="aqr-detail-card">
@@ -1030,6 +1053,7 @@ function Detail({ entry, match, message, mention, sending, busy, readOnly, copyi
                 <span className="aqr-detail-meta">更新于 {relativeTime(entry.updatedAt)}{count ? ` · ${count} 张图片` : ""}</span>
             </div>
             <div className="aqr-detail-tools">
+                {canEditCloud && <Button icon="edit" size="sm" disabled={busy} onClick={onEdit}>编辑云端</Button>}
                 {readOnly ? <Button icon="import" size="sm" loading={copying} disabled={busy && !copying} onClick={onSaveLocal}>保存到本地</Button> : <><Button
                     variant="ghost" size="sm"
                     className={cx("aqr-fav", entry.favorite && "is-on")}

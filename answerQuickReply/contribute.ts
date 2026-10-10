@@ -19,10 +19,11 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export type LibraryAccess = "" | "open" | "ok" | "denied" | "recheck";
 const ACCESS_VALUES: readonly LibraryAccess[] = ["open", "ok", "denied", "recheck"];
 interface Session { token: string; expiresAt: number; user: { id: string; username: string; }; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; }
-export interface ContributionState { ready: boolean; enabled: boolean; loginUrl: string; user: Session["user"] | null; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; automaticLogin: boolean; autoLoginUrl: string; loginWaiting: boolean; }
-export interface Submission { id: string; title: string; status: "pending" | "published" | "rejected"; createdAt: number; updatedAt: number; reason?: string; submitterId?: string; }
+export interface ContributionState { ready: boolean; enabled: boolean; loginUrl: string; user: Session["user"] | null; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; automaticLogin: boolean; autoLoginUrl: string; loginWaiting: boolean; cloudEditing: boolean; }
+export interface CloudUpdate { targetId: string; baseUpdatedAt: number; }
+export interface Submission { id: string; title: string; status: "pending" | "published" | "rejected"; createdAt: number; updatedAt: number; reason?: string; submitterId?: string; update?: CloudUpdate; }
 export interface SubmissionDetail extends Submission { entry: QREntry; }
-let state: ContributionState = { ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", loginWaiting: false };
+let state: ContributionState = { ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", loginWaiting: false, cloudEditing: false };
 interface LoginAttempt { id: string; verifier: string; userId: string; url: string; expires: number; controller: AbortController; polling?: Promise<void>; }
 let loginAttempt: LoginAttempt | undefined;
 let preparingLogin: Promise<void> | undefined;
@@ -49,7 +50,7 @@ export function stopContributions(): void {
     cancelAutomaticLogin();
     active = false; generation++; busy = false; loaded = false; loading = undefined; session = null; pending = {};
     controllers.forEach(controller => controller.abort()); controllers.clear();
-    update({ ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", loginWaiting: false });
+    update({ ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", loginWaiting: false, cloudEditing: false });
 }
 function sessionFrom(value: unknown): Session {
     const s = value as Session;
@@ -160,7 +161,7 @@ export async function loadContributionPanel(): Promise<void> {
     const expected = generation; await loadLocal(); check(expected);
     const status = await api("/contributions/status", undefined, false);
     if (typeof status?.enabled !== "boolean" || (status.enabled && status.loginUrl !== LOGIN_URL)) throw new Error("贡献服务状态或登录地址不正确。");
-    update({ ready: true, enabled: status.enabled, loginUrl: status.enabled ? LOGIN_URL : "", canReview: false, canAutoPublish: false, automaticLogin: status.automaticLogin === true });
+    update({ ready: true, enabled: status.enabled, loginUrl: status.enabled ? LOGIN_URL : "", canReview: false, canAutoPublish: false, automaticLogin: status.automaticLogin === true, cloudEditing: status.cloudEditing === true });
     if (status.enabled && session) {
         const me = await api("/contributions/me");
         try { session = sessionFrom({ ...me, token: session!.token }); }
@@ -300,11 +301,16 @@ export function snapshotContribution(entry: QREntry): QREntry {
     result.images.forEach(Object.freeze); Object.freeze(result.images); Object.freeze(result.keywords); Object.freeze(result.weakKeywords);
     return Object.freeze(result);
 }
+function cloudUpdate(value: CloudUpdate): CloudUpdate {
+    if (!value || typeof value.targetId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(value.targetId)
+        || !Number.isSafeInteger(value.baseUpdatedAt) || value.baseUpdatedAt < 0 || value.baseUpdatedAt >= Number.MAX_SAFE_INTEGER) throw new Error("云端编辑目标或版本无效。");
+    return Object.freeze({ targetId: value.targetId, baseUpdatedAt: value.baseUpdatedAt });
+}
 function summary(value: any): Submission {
     if (!value || typeof value.id !== "string" || !uuid.test(value.id) || typeof value.title !== "string" || value.title.length > 120
         || !["pending", "published", "rejected"].includes(value.status) || !Number.isFinite(value.createdAt) || !Number.isFinite(value.updatedAt)
         || (value.reason !== undefined && (typeof value.reason !== "string" || value.reason.length > 500))) throw new Error("提交记录格式不正确。");
-    return { id: value.id, title: value.title, status: value.status, createdAt: value.createdAt, updatedAt: value.updatedAt, reason: value.reason, submitterId: value.submitterId };
+    return { id: value.id, title: value.title, status: value.status, createdAt: value.createdAt, updatedAt: value.updatedAt, reason: value.reason, submitterId: value.submitterId, update: value.update === undefined ? undefined : cloudUpdate(value.update) };
 }
 export async function listSubmissions(review = false): Promise<Submission[]> {
     if (review && !state.canReview) throw new Error("服务未授予审核权限。");
@@ -319,23 +325,29 @@ export async function readSubmission(id: string): Promise<SubmissionDetail> {
     if (record.id !== id) throw new Error("提交详情 ID 不匹配。");
     return { ...record, entry: snapshotContribution(result.submission.entry) };
 }
-export async function submitContribution(entry: QREntry): Promise<{ id: string; status: "pending" | "published"; }> {
+export async function submitContribution(entry: QREntry, update?: CloudUpdate): Promise<{ id: string; status: "pending" | "published"; }> {
     const snapshot = snapshotContribution(entry);
+    const replacement = update === undefined ? undefined : cloudUpdate(update);
+    if (replacement && snapshot.id !== replacement.targetId) throw new Error("编辑内容与云端条目 ID 不匹配。");
     return exclusive(async () => {
         if (!state.enabled) throw new Error("管理员尚未开通提交。");
         if (!session) throw new Error("请先登录贡献服务。");
+        if (replacement && (!state.cloudEditing || getRemoteState().config.url !== DEFAULT_REMOTE_URL)) throw new Error("当前云端服务不支持直接编辑，请更新服务或切回社区云端。");
         const expected = generation;
-        const bytes = new TextEncoder().encode(JSON.stringify({ user: session.user.id, entry: snapshot }));
+        const bytes = new TextEncoder().encode(JSON.stringify({ user: session.user.id, entry: snapshot, ...(replacement ? { update: replacement } : {}) }));
         const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(n => n.toString(16).padStart(2, "0")).join("");
         check(expected);
         const requestId = pending[digest] ?? crypto.randomUUID();
         const reserved = { ...pending, [digest]: requestId };
         await write(PENDING_KEY, reserved); check(expected); pending = reserved;
-        const result = await api("/contributions", { entry: snapshot, requestId });
+        const result = await api("/contributions", { entry: snapshot, requestId, ...(replacement ? { update: replacement } : {}) });
         if (!uuid.test(result?.id) || !["pending", "published"].includes(result?.status)) throw new Error("提交返回结果不正确，请重试确认。");
         const confirmed = { ...pending }; delete confirmed[digest];
         await write(PENDING_KEY, confirmed); check(expected); pending = confirmed;
-        if (result.status === "published" && getRemoteState().config.url === DEFAULT_REMOTE_URL) void refreshRemoteLibrary().catch(() => {});
+        if (result.status === "published" && getRemoteState().config.url === DEFAULT_REMOTE_URL) {
+            clearRemoteCache(); // Cancel reads started before publication; never reuse a stale in-flight response.
+            void refreshRemoteLibrary().catch(() => {});
+        }
         return { id: result.id, status: result.status };
     });
 }
@@ -345,7 +357,10 @@ export async function reviewSubmission(id: string, decision: "approve" | "reject
         if (!uuid.test(id) || !["approve", "reject"].includes(decision) || reason.length > 500) throw new Error("审核参数不正确。");
         const result = await api(`/contributions/${id}/review`, { decision, reason: reason.trim() });
         if (result?.id !== id || !["published", "rejected"].includes(result?.status)) throw new Error("审核返回结果不正确，请刷新列表确认。");
-        if (result.status === "published" && getRemoteState().config.url === DEFAULT_REMOTE_URL) void refreshRemoteLibrary().catch(() => {});
+        if (result.status === "published" && getRemoteState().config.url === DEFAULT_REMOTE_URL) {
+            clearRemoteCache();
+            void refreshRemoteLibrary().catch(() => {});
+        }
         return result.status;
     });
 }

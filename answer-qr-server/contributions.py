@@ -258,6 +258,11 @@ class Contributions:
                         message TEXT, last_poll INTEGER NOT NULL DEFAULT 0);
                     CREATE TABLE IF NOT EXISTS auto_states (state_key TEXT PRIMARY KEY, login_id TEXT NOT NULL);
                 """)
+                # Additive migration: existing submissions remain ordinary creates.
+                columns = {row[1] for row in db.execute("PRAGMA table_info(submissions)")}
+                for name, kind in (("target_id", "TEXT"), ("base_updated_at", "INTEGER")):
+                    if name not in columns:
+                        db.execute("ALTER TABLE submissions ADD COLUMN " + name + " " + kind)
                 self._cleanup(db)
             self.recover()
 
@@ -577,6 +582,8 @@ class Contributions:
     def _summary(self, row):
         result = {"id": row["id"], "title": row["title"], "status": "pending" if row["status"] == "publishing" else row["status"],
                   "createdAt": row["created_at"], "updatedAt": row["updated_at"], "submitterId": row["submitter_id"]}
+        if row["target_id"] is not None:
+            result["update"] = {"targetId": row["target_id"], "baseUpdatedAt": row["base_updated_at"]}
         if row["status"] == "publishing":
             result["reason"] = "发布正在恢复，暂不能驳回。"
         elif row["reason"]:
@@ -586,7 +593,7 @@ class Contributions:
     def _list(self, session, pending):
         if pending and not self._profile(session)["canReview"]:
             raise ApiError(403, "review_forbidden", "此 Discord 账号没有审核权限。")
-        fields = "id,title,status,created_at,updated_at,reason,submitter_id"
+        fields = "id,title,status,created_at,updated_at,reason,submitter_id,target_id,base_updated_at"
         with self.lock, self._db() as db:
             if pending:
                 rows = db.execute("SELECT " + fields + " FROM submissions WHERE status IN ('pending','publishing') ORDER BY created_at LIMIT 100").fetchall()
@@ -616,17 +623,26 @@ class Contributions:
     def _submit(self, session, body):
         if self.library_verdict(session["user_id"]) not in ("open", "ok"):
             raise ApiError(403, "library_forbidden", "投稿仅对拥有答疑身份组的成员开放；如刚获得身份组，请重新登录。")
-        strict_object(body, ("entry", "requestId"))
+        strict_object(body, ("entry", "requestId"), ("update",))
+        update = body.get("update")
+        if "update" in body:
+            strict_object(update, ("targetId", "baseUpdatedAt"))
+            if (not isinstance(update["targetId"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", update["targetId"])
+                    or type(update["baseUpdatedAt"]) is not int or not 0 <= update["baseUpdatedAt"] < 9007199254740991):
+                raise ApiError(400, "invalid_update", "云端编辑目标或版本无效。")
         request_id = body["requestId"]
         if not isinstance(request_id, str) or not re.fullmatch(UUID_PATTERN, request_id):
             raise ApiError(400, "invalid_request_id", "提交编号必须是 UUID。")
         try:
             validate_archive({"version": 1, "entries": [body["entry"]]})
-            fingerprint = digest(json_bytes(body["entry"]).decode("utf-8"))
+            if update and body["entry"]["id"] != update["targetId"]:
+                raise ApiError(400, "invalid_update", "编辑内容与云端条目 ID 不匹配。")
+            fingerprint = digest(json_bytes({"entry": body["entry"], "update": update} if update else body["entry"]).decode("utf-8"))
         except (ArchiveError, ValueError) as exc:
             raise ApiError(400, "invalid_entry", "QR 格式、文字或图片不符合共享库限制。") from exc
         now = self.clock()
         with self.lock:
+            self.recover()
             with self._db() as db:
                 self._cleanup(db)
                 existing = db.execute("SELECT id,status,request_hash FROM submissions WHERE submitter_id=? AND request_id=?", (session["user_id"], request_id)).fetchone()
@@ -635,16 +651,22 @@ class Contributions:
                         raise ApiError(409, "request_id_reused", "同一提交编号不能用于不同内容。")
                     submission_id, status = existing["id"], existing["status"]
                 else:
+                    if update:
+                        archive = parse_archive(read_bounded(self.library_path))
+                        current = next((item for item in archive["entries"] if item["id"] == update["targetId"]), None)
+                        self._check_update(current, update["baseUpdatedAt"])
                     counts = db.execute("SELECT count(*),coalesce(sum(payload_bytes),0),sum(status IN ('pending','publishing')) FROM submissions").fetchone()
                     user_pending = db.execute("SELECT count(*) FROM submissions WHERE submitter_id=? AND status IN ('pending','publishing')", (session["user_id"],)).fetchone()[0]
                     submission_id = str(uuid.uuid4())
-                    entry = {**body["entry"], "id": "shared_" + uuid.uuid4().hex, "updatedAt": now,
+                    entry = {**body["entry"], "id": update["targetId"] if update else "shared_" + uuid.uuid4().hex,
+                             "updatedAt": max(now, update["baseUpdatedAt"] + 1) if update else now,
                              "images": [{**image, "id": "image_" + uuid.uuid4().hex} for image in body["entry"]["images"]]}
                     payload = json_bytes(entry)
                     if counts[0] >= MAX_SUBMISSIONS or counts[1] + len(payload) > MAX_PAYLOAD_BYTES or (counts[2] or 0) >= MAX_PENDING or user_pending >= MAX_USER_PENDING:
                         raise ApiError(429, "submission_limit", "待审数量或保存空间已达上限，请等待审核或联系管理员。")
-                    db.execute("INSERT INTO submissions(id,submitter_id,username,request_id,request_hash,entry_id,entry_json,payload_bytes,title,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?)",
-                               (submission_id, session["user_id"], session["username"], request_id, fingerprint, entry["id"], payload.decode("utf-8"), len(payload), entry["title"], now, now))
+                    db.execute("INSERT INTO submissions(id,submitter_id,username,request_id,request_hash,entry_id,entry_json,payload_bytes,title,status,created_at,updated_at,target_id,base_updated_at) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
+                               (submission_id, session["user_id"], session["username"], request_id, fingerprint, entry["id"], payload.decode("utf-8"), len(payload), entry["title"], now, now,
+                                update["targetId"] if update else None, update["baseUpdatedAt"] if update else None))
                     status = "pending"
             if status == "publishing" or (status == "pending" and self._profile(session)["canAutoPublish"]):
                 self._publish(submission_id, session["user_id"], "auto_publish")
@@ -652,6 +674,13 @@ class Contributions:
             if status == "rejected":
                 raise ApiError(409, "submission_rejected", "这条提交已驳回；修改后请使用新的提交编号。")
             return {"id": submission_id, "status": status}
+
+    @staticmethod
+    def _check_update(current, base_updated_at):
+        if current is None:
+            raise ApiError(409, "update_target_missing", "原云端 QR 已移除，不能替换；请刷新云端库。")
+        if current["updatedAt"] != base_updated_at:
+            raise ApiError(409, "update_conflict", "云端 QR 已被更新，本次修改未覆盖它。请保留草稿，刷新后基于最新版重新编辑；待审旧版本请驳回后重新提交。")
 
     def _prune_publish_backups(self, directory):
         files = sorted((path for path in directory.iterdir() if re.fullmatch(r"[0-9]{13}-[0-9a-f]{32}\.json", path.name) and path.is_file() and not path.is_symlink()), key=lambda path: path.name)
@@ -673,16 +702,25 @@ class Contributions:
             if row["status"] == "rejected":
                 raise ApiError(409, "already_reviewed", "这条提交已驳回，不能直接发布。")
             entry = json.loads(row["entry_json"])
+            with self._db() as db:
+                if db.execute("SELECT 1 FROM submissions WHERE entry_id=? AND status='publishing' AND id!=?", (row["entry_id"], submission_id)).fetchone():
+                    raise ApiError(503, "publish_recovering", "同一条 QR 的上次发布正在恢复，请稍后重试。")
             if self.library_path.is_symlink():
                 raise ApiError(503, "publish_unavailable", "共享库路径需要管理员检查。")
             with update_lock(self.library_path):
                 previous = read_bounded(self.library_path)
                 archive = parse_archive(previous)
                 present = next((item for item in archive["entries"] if item["id"] == row["entry_id"]), None)
-                if present is not None and present != entry:
+                # A committed publishing intent may already have replaced the file.
+                already_written = present == entry and row["status"] == "publishing"
+                if row["target_id"] is not None and not already_written:
+                    self._check_update(present, row["base_updated_at"])
+                elif row["target_id"] is None and present is not None and present != entry:
                     raise ApiError(503, "publish_conflict", "共享库条目发生冲突，需要管理员检查。")
-                if present is None:
-                    combined = {"version": 1, "entries": [*archive["entries"], entry]}
+                needs_write = present != entry
+                if needs_write:
+                    entries = [entry if item["id"] == row["target_id"] else item for item in archive["entries"]] if row["target_id"] is not None else [*archive["entries"], entry]
+                    combined = {"version": 1, "entries": entries}
                     raw = json_bytes(combined)
                     try:
                         parse_archive(raw)
@@ -693,7 +731,7 @@ class Contributions:
                         db.execute("UPDATE submissions SET status='publishing',updated_at=? WHERE id=?", (self.clock(), submission_id))
                         db.execute("INSERT OR IGNORE INTO reviews VALUES(?,?,?,?,?)", (submission_id, reviewer_id or row["submitter_id"], decision, reason, self.clock()))
                 # Crash after this commit is recovered using the stable generated entry ID.
-                if present is None:
+                if needs_write:
                     directory = self.library_path.parent / "publish-backups"
                     directory.mkdir(mode=0o700, exist_ok=True)
                     backup = directory / (str(self.clock()) + "-" + uuid.uuid4().hex + ".json")
@@ -738,7 +776,7 @@ class Contributions:
             return False
         try:
             if path == "/contributions/status" and handler.command == "GET" and not parsed.query:
-                handler.respond(200, {"enabled": self.enabled, "loginUrl": self.config["publicBaseUrl"] + "/auth/login", "automaticLogin": True})
+                handler.respond(200, {"enabled": self.enabled, "loginUrl": self.config["publicBaseUrl"] + "/auth/login", "automaticLogin": True, "cloudEditing": True})
                 return True
             if not self.enabled:
                 raise ApiError(503, "contributions_disabled", "管理员尚未配置 Discord 登录，提交与审核暂未开放；共享库仍可读取。")

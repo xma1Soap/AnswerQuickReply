@@ -82,14 +82,14 @@ test ! -f /var/lib/answer-qr/library.json.lock || chown answerqr:answerqr /var/l
 
 | 方法与路径 | 作用 |
 | --- | --- |
-| `GET /contributions/status` | `{enabled, loginUrl}`；免登录 |
+| `GET /contributions/status` | `{enabled, loginUrl, automaticLogin, cloudEditing}`；免登录 |
 | `GET /library.json` | 同一 Bearer；需要答疑身份组。401 未登录或需重新登录复查，403 无身份组，429 下载过于频繁 |
 | `GET /auth/login` | 浏览器进入 Discord OAuth，随机 state 绑定 HttpOnly/Secure/SameSite=Lax cookie |
 | `GET /auth/callback` | 校验 state/cookie，经服务端交换 code，读取 `/users/@me` 与本服务器身份组；有身份组才在 HTML 中显示一次性登录码，否则 403 |
 | `POST /auth/exchange` | 必须单个 `Authorization: LoginCode <一次性码>`，JSON body 为 `{}`；返回 `{token,expiresAt,user:{id,username},canReview,canAutoPublish,libraryAccess}`；`libraryAccess` 为 `open`/`ok`/`denied`/`recheck` |
 | `GET /contributions/me` | `Authorization: Bearer <本服务会话>`，返回上述资料但不含 token |
 | `POST /auth/logout` | 同一 Bearer、body `{}`；删除会话 |
-| `POST /contributions` | 同一 Bearer、需要答疑身份组、body `{entry,requestId:UUID}`；返回 `{id,status:"pending"或"published"}` |
+| `POST /contributions` | 同一 Bearer、需要答疑身份组、body `{entry,requestId:UUID,update?:{targetId,baseUpdatedAt}}`；返回 `{id,status:"pending"或"published"}` |
 | `GET /contributions/mine` | 返回自己最近 100 条摘要 `{submissions:[...]}` |
 | `GET /contributions/pending` | 审核员读取最多 100 条待审摘要 |
 | `GET /contributions/<uuid>` | 作者或审核员读取 `{submission:{id,title,status,createdAt,updatedAt,reason?,submitterId,entry}}` |
@@ -100,6 +100,18 @@ test ! -f /var/lib/answer-qr/library.json.lock || chown answerqr:answerqr /var/l
 客户端须固定 HTTPS 目标、拒绝意外重定向、不给请求附带 Discord token 或 Cookie。一次性码仅在 Authorization 中发送，**不支持 body.code**。同一 UUID 重试相同内容幂等；同一账号以相同 UUID 改成不同内容返回 409。网络报错后应保留 requestId 重试，不能换一个 UUID 盲目重发。
 
 ## 发布、恢复和容量
+
+### 替换已发布的条目
+
+新版客户端在 `POST /contributions` 携带 `update: {targetId, baseUpdatedAt}` 时申请替换。`targetId` 必须等于 `entry.id`，`baseUpdatedAt` 为开始编辑时共享条目的 `updatedAt`；服务器校验目标存在和版本一致。未携带 `update` 的旧客户端仍按新增投稿处理，不能仅凭客户端自选 ID 覆盖条目。
+
+新增和修改使用同一服务端身份组鉴权、`autoPublishIds` 免审名单、审核员权限、图片验证和限额。修改保留公共 QR ID 和库内位置；待审修改不影响当前库。摘要和详情包含可选 `update`，供审核界面区分修改申请。已发布详情仍展示该公共条目的当前内容，不是历史版本；发布前备份单独保留。
+
+替换时在文件锁内再次核对版本，过期编辑和过期审核返回 409 `update_conflict`，目标已删除返回 409 `update_target_missing`。批准失败后仍可驳回旧申请；不能强制覆盖。服务端分配严格递增的 `updatedAt`，忽略客户端填写的新时间。手动整库维护如修改了内容，也应更新 `updatedAt`。
+
+请求幂等摘要同时包含编辑目标、基础版本和内容。发布意图与稳定目标持久化，文件替换前后崩溃均可恢复；重复请求只返回原结果。启动时自动给旧 SQLite 增加可空 `target_id`、`base_updated_at` 两列，旧提交默认为新增；部署前应备份数据库和库文件。替换沿用下面的原子写入、容量校验与发布前备份。
+
+### 新增及共同规则
 
 发布先在 SQLite 提交 `publishing` 意图，随后取得与 root 更新脚本相同的库文件锁，在原库上追加并原子替换，最后标记 `published`。每个提交的公共 entry ID 由服务端生成并持久化。重启恢复遇到已写入且完全相同的 entry ID 时只补记完成；尚未写入时追加一次，不用客户端 ID 覆盖旧内容。`publishing` 或 `published` 状态都不能驳回。
 

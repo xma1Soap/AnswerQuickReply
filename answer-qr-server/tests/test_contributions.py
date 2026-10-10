@@ -114,7 +114,7 @@ class ContributionTests(unittest.TestCase):
         self.write_config()
         with self.running() as server:
             status, _, body = self.api(server, "/contributions/status")
-            self.assertEqual((status, body), (200, {"enabled": False, "loginUrl": self.config["publicBaseUrl"] + "/auth/login", "automaticLogin": True}))
+            self.assertEqual((status, body), (200, {"enabled": False, "loginUrl": self.config["publicBaseUrl"] + "/auth/login", "automaticLogin": True, "cloudEditing": True}))
             self.assertEqual(request(server)[0], 200)
             for path, method in (("/auth/login", "GET"), ("/auth/callback?code=anything&state=anything", "GET"),
                                  ("/auth/exchange", "POST"), ("/auth/logout", "POST"), ("/contributions", "POST"),
@@ -353,6 +353,153 @@ class ContributionTests(unittest.TestCase):
             self.assertEqual(len(parse_archive(self.library.read_bytes())["entries"]), 1)
             with closing(sqlite3.connect(self.database)) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM reviews").fetchone()[0], 1)
+
+    def edit(self, server, token, original, content="updated reply", request_id=None):
+        payload = {"entry": {**original, "content": content, "keywords": ["new keyword"], "images": [image()]},
+                   "update": {"targetId": original["id"], "baseUpdatedAt": original["updatedAt"]},
+                   "requestId": request_id or str(uuid.uuid4())}
+        return self.api(server, "/contributions", "POST", payload, token), payload
+
+    def test_cloud_edit_auto_publish_replaces_in_place_and_retry_is_idempotent(self):
+        original, untouched = entry(), {**entry(), "id": "untouched"}
+        self.library.write_text(json.dumps({"version": 1, "entries": [original, untouched]}), encoding="utf-8")
+        with self.running() as server:
+            admin, _ = self.login(server, "admin")
+            self.assertTrue(self.api(server, "/contributions/status")[2]["cloudEditing"])
+            response, payload = self.edit(server, admin, original)
+            self.assertEqual((response[0], response[2]["status"]), (200, "published"))
+            saved = parse_archive(self.library.read_bytes())["entries"]
+            self.assertEqual([item["id"] for item in saved], [original["id"], untouched["id"]])
+            self.assertEqual(saved[1], untouched)
+            self.assertEqual(saved[0]["content"], payload["entry"]["content"])
+            self.assertEqual(saved[0]["keywords"], ["new keyword"])
+            self.assertEqual(saved[0]["images"][0]["dataUrl"], image()["dataUrl"])
+            self.assertGreater(saved[0]["updatedAt"], original["updatedAt"])
+            self.assertEqual(self.api(server, "/contributions", "POST", payload, admin)[2], response[2])
+            self.assertEqual(parse_archive(self.library.read_bytes())["entries"], saved)
+            self.assertEqual(self.edit(server, admin, original)[0][0], 409)
+            # Even two saves during the same clock tick must get distinct versions.
+            self.assertEqual(self.edit(server, admin, saved[0], "second update")[0][0], 200)
+            self.assertGreater(parse_archive(self.library.read_bytes())["entries"][0]["updatedAt"], saved[0]["updatedAt"])
+            changed_target = copy.deepcopy(payload)
+            changed_target["update"]["baseUpdatedAt"] += 1
+            self.assertEqual(self.api(server, "/contributions", "POST", changed_target, admin)[0], 409)
+
+    def test_cloud_edit_member_pending_reject_and_approve(self):
+        original = entry()
+        self.library.write_text(json.dumps({"version": 1, "entries": [original]}), encoding="utf-8")
+        before = self.library.read_bytes()
+        with self.running() as server:
+            member, _ = self.login(server)
+            admin, _ = self.login(server, "admin")
+            response, payload = self.edit(server, member, original)
+            self.assertEqual((response[0], response[2]["status"]), (200, "pending"))
+            self.assertEqual(self.library.read_bytes(), before)
+            path = "/contributions/" + response[2]["id"]
+            self.assertEqual(self.api(server, path, token=admin)[2]["submission"]["update"], payload["update"])
+            self.assertEqual(self.api(server, "/contributions/pending", token=admin)[2]["submissions"][0]["update"], payload["update"])
+            self.assertEqual(self.api(server, path + "/review", "POST", {"decision": "approve"}, member)[0], 403)
+            self.assertEqual(self.api(server, path + "/review", "POST", {"decision": "reject"}, admin)[0], 200)
+            self.assertEqual(self.library.read_bytes(), before)
+            response, _ = self.edit(server, member, original, "revised update")
+            path = "/contributions/" + response[2]["id"]
+            self.assertEqual(self.api(server, path + "/review", "POST", {"decision": "approve"}, admin)[0], 200)
+            saved = parse_archive(self.library.read_bytes())["entries"]
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]["id"], original["id"])
+            self.assertEqual(saved[0]["content"], "revised update")
+
+    def test_cloud_edit_stale_review_and_deleted_target_do_not_overwrite(self):
+        original = entry()
+        self.library.write_text(json.dumps({"version": 1, "entries": [original]}), encoding="utf-8")
+        with self.running() as server:
+            member, _ = self.login(server)
+            admin, _ = self.login(server, "admin")
+            pending, _ = self.edit(server, member, original, "old suggestion")
+            self.assertEqual(self.edit(server, admin, original, "new live reply")[0][0], 200)
+            before = self.library.read_bytes()
+            path = "/contributions/" + pending[2]["id"] + "/review"
+            response = self.api(server, path, "POST", {"decision": "approve"}, admin)
+            self.assertEqual((response[0], response[2]["error"]), (409, "update_conflict"))
+            self.assertEqual(self.library.read_bytes(), before)
+            self.assertEqual(self.api(server, path, "POST", {"decision": "reject"}, admin)[0], 200)
+            latest = parse_archive(before)["entries"][0]
+            pending, _ = self.edit(server, member, latest)
+            self.library.write_bytes(EMPTY_ARCHIVE)
+            self.assertEqual(self.edit(server, admin, latest)[0][2]["error"], "update_target_missing")
+            path = "/contributions/" + pending[2]["id"] + "/review"
+            self.assertEqual(self.api(server, path, "POST", {"decision": "approve"}, admin)[2]["error"], "update_target_missing")
+            self.assertEqual(self.library.read_bytes(), EMPTY_ARCHIVE)
+
+    def test_cloud_edit_malformed_targets_and_permissions(self):
+        original = entry()
+        self.library.write_text(json.dumps({"version": 1, "entries": [original]}), encoding="utf-8")
+        with self.running() as server:
+            admin, _ = self.login(server, "admin")
+            payload = {"entry": original, "requestId": str(uuid.uuid4()), "update": {"targetId": original["id"], "baseUpdatedAt": original["updatedAt"]}}
+            self.assertEqual(self.api(server, "/contributions", "POST", payload)[0], 401)
+            for update in (None, {}, {"targetId": "../test", "baseUpdatedAt": 1}, {"targetId": original["id"], "baseUpdatedAt": True},
+                           {"targetId": original["id"], "baseUpdatedAt": 9007199254740991}, {"targetId": "another", "baseUpdatedAt": 1}):
+                self.assertEqual(self.api(server, "/contributions", "POST", {**payload, "update": update}, admin)[0], 400)
+            # Server permission checks still apply to whitelist members and edited IDs.
+            with patch.object(server.contributions, "library_verdict", return_value="denied"):
+                self.assertEqual(self.api(server, "/contributions", "POST", payload, admin)[0], 403)
+            self.assertEqual(parse_archive(self.library.read_bytes())["entries"], [original])
+
+    def test_cloud_edit_concurrent_review_only_one_revision_wins(self):
+        original = entry()
+        self.library.write_text(json.dumps({"version": 1, "entries": [original]}), encoding="utf-8")
+        with self.running() as server:
+            member, _ = self.login(server)
+            admin, _ = self.login(server, "admin")
+            ids = [self.edit(server, member, original, content)[0][2]["id"] for content in ("revision A", "revision B")]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                responses = list(pool.map(lambda value: self.api(server, "/contributions/" + value + "/review", "POST", {"decision": "approve"}, admin), ids))
+            self.assertEqual(sorted(response[0] for response in responses), [200, 409])
+            saved = parse_archive(self.library.read_bytes())["entries"]
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]["id"], original["id"])
+            self.assertIn(saved[0]["content"], ("revision A", "revision B"))
+
+    def test_cloud_edit_crash_before_and_after_replace_recovers(self):
+        import contributions
+        original = entry()
+        self.library.write_text(json.dumps({"version": 1, "entries": [original]}), encoding="utf-8")
+        with self.running() as server:
+            admin, _ = self.login(server, "admin")
+            for after in (False, True):
+                current = parse_archive(self.library.read_bytes())["entries"][0]
+                write = contributions.atomic_write
+                def fail(destination, raw, owner=None):
+                    if destination == self.library and not after:
+                        raise OSError("simulated failure before replace")
+                    write(destination, raw, owner)
+                    if destination == self.library:
+                        raise OSError("simulated failure after replace")
+                with patch("contributions.atomic_write", side_effect=fail):
+                    response, payload = self.edit(server, admin, current, "after crash " + str(after))
+                    self.assertEqual(response[0], 503)
+                Contributions(self.library, self.config_path, self.identity, lambda: self.now)
+                response = self.api(server, "/contributions", "POST", payload, admin)
+                self.assertEqual(response[2]["status"], "published")
+                saved = parse_archive(self.library.read_bytes())["entries"]
+                self.assertEqual(len(saved), 1)
+                self.assertEqual(saved[0]["content"], payload["entry"]["content"])
+
+    def test_cloud_edit_additive_schema_upgrade_preserves_legacy_submission(self):
+        with self.running() as server:
+            member, _ = self.login(server)
+            response, payload = self.submit(server, member)
+            submission_id = response[2]["id"]
+        with closing(sqlite3.connect(self.database)) as db:
+            db.execute("ALTER TABLE submissions DROP COLUMN target_id")
+            db.execute("ALTER TABLE submissions DROP COLUMN base_updated_at")
+            db.commit()
+        with self.running() as server:
+            self.assertEqual(self.api(server, "/contributions", "POST", payload, member)[2]["id"], submission_id)
+            self.assertNotIn("update", self.api(server, "/contributions/" + submission_id, token=member)[2]["submission"])
+            admin, _ = self.login(server, "admin")
+            self.assertEqual(self.api(server, "/contributions/" + submission_id + "/review", "POST", {"decision": "approve"}, admin)[0], 200)
 
     def test_invalid_entries_body_limit_and_cors(self):
         with self.running() as server:

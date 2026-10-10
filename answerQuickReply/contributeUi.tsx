@@ -122,9 +122,10 @@ function ContributionPanel({ modalProps, draft }: { modalProps: RenderModalProps
                         <div className="aqr-contribution-list">{items.map(item => <button key={item.id} type="button" className="aqr-btn" disabled={busy} onClick={() => void run(async () => {
                             setDetail(null); setReason("");
                             const next = await readSubmission(item.id); if (mounted.current) { setDetail(next); setReason(""); }
-                        })}>{item.title} · {statusName[item.status]}</button>)}{!items.length && <p>暂无{review ? "待审核记录" : "提交记录"}。</p>}</div>
+                        })}>{item.update ? "【修改】" : "【新增】"}{item.title} · {statusName[item.status]}</button>)}{!items.length && <p>暂无{review ? "待审核记录" : "提交记录"}。</p>}</div>
                         {detail && <section>
                             <p>{statusName[detail.status]}{detail.submitterId ? ` · 提交者 ${detail.submitterId}` : ""}</p>
+                            {detail.update && <p className="aqr-banner is-info">这是一条云端修改申请，通过后替换原条目，不新增 QR。{detail.status === "pending" ? "审核前原内容仍可使用；若原条目已更新，系统会阻止旧修改覆盖。" : ""}</p>}
                             <ContributionPreview entry={detail.entry} />
                             {detail.reason && <p>审核说明：{detail.reason}</p>}
                             {review && service.canReview && detail.status === "pending" && <>
