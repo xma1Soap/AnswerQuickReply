@@ -43,6 +43,8 @@ MAX_CALLBACK_QUERY = 8 * 1024
 MAX_CALLBACK_FIELDS = 32
 UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 SUBMISSION_PATH = re.compile(r"^/contributions/(" + UUID_PATTERN + r")(/review)?$")
+AUTO_LOGIN_PATH = re.compile(r"^/auth/auto/login/([A-Za-z0-9_-]{43})$")
+AUTO_POLL_MS = 5000
 
 
 class ApiError(Exception):
@@ -250,6 +252,11 @@ class Contributions:
                     CREATE TABLE IF NOT EXISTS access (user_id TEXT PRIMARY KEY, allowed INTEGER NOT NULL, checked_at INTEGER NOT NULL);
                     CREATE TABLE IF NOT EXISTS library_reads (user_id TEXT NOT NULL, at INTEGER NOT NULL);
                     CREATE INDEX IF NOT EXISTS library_reads_user ON library_reads(user_id, at);
+                    CREATE TABLE IF NOT EXISTS auto_logins (
+                        id TEXT PRIMARY KEY, challenge TEXT NOT NULL, expected_user TEXT NOT NULL,
+                        expires INTEGER NOT NULL, status TEXT NOT NULL, user_id TEXT, username TEXT,
+                        message TEXT, last_poll INTEGER NOT NULL DEFAULT 0);
+                    CREATE TABLE IF NOT EXISTS auto_states (state_key TEXT PRIMARY KEY, login_id TEXT NOT NULL);
                 """)
                 self._cleanup(db)
             self.recover()
@@ -274,6 +281,10 @@ class Contributions:
         now = self.clock()
         for table in ("states", "codes", "sessions"):
             db.execute("DELETE FROM " + table + " WHERE expires <= ?", (now,))
+        db.execute("DELETE FROM auto_logins WHERE expires <= ?", (now,))
+        # Keep cancelled attempt bindings until their OAuth state expires; an
+        # in-flight callback must not silently fall back to manual code login.
+        db.execute("DELETE FROM auto_states WHERE state_key NOT IN (SELECT key FROM states)")
         db.execute("UPDATE submissions SET entry_json=NULL,payload_bytes=0 WHERE status='rejected' AND entry_json IS NOT NULL AND updated_at <= ?", (now - REJECTED_PAYLOAD_MS,))
         db.execute("DELETE FROM library_reads WHERE at <= ?", (now - AUDIT_RETENTION_MS,))
 
@@ -293,6 +304,10 @@ class Contributions:
         return path == "/contributions" or path.startswith("/contributions/") or path.startswith("/auth/")
 
     def methods(self, path):
+        if AUTO_LOGIN_PATH.fullmatch(path):
+            return {"GET"}
+        if path in ("/auth/auto/start", "/auth/auto/poll", "/auth/auto/cancel"):
+            return {"POST"}
         if path in ("/contributions/status", "/contributions/me", "/contributions/mine", "/contributions/pending", "/auth/login", "/auth/callback"):
             return {"GET"}
         if path in ("/auth/exchange", "/auth/logout", "/contributions"):
@@ -392,13 +407,71 @@ class Contributions:
             raise ApiError(400, "invalid_oauth_state", "浏览器发送的登录校验 Cookie 无效或重复，请从插件重新打开登录。")
         return values[0], selected
 
-    def _login(self, handler):
+    def _auto_start(self, handler):
+        body = strict_object(read_json(handler), ("challenge", "userId"))
+        if not isinstance(body["challenge"], str) or not re.fullmatch(r"[a-f0-9]{64}", body["challenge"]) or not isinstance(body["userId"], str) or not re.fullmatch(r"[0-9]{17,20}", body["userId"]):
+            raise ApiError(400, "invalid_request", "自动登录请求无效，请从插件重新发起。")
+        login_id, expires = secrets.token_urlsafe(32), self.clock() + STATE_MS
+        with self.lock, self._db() as db:
+            self._cleanup(db)
+            if db.execute("SELECT count(*) FROM auto_logins").fetchone()[0] >= 1000:
+                raise ApiError(429, "login_busy", "登录请求过多，请稍后再试。")
+            db.execute("INSERT INTO auto_logins(id,challenge,expected_user,expires,status) VALUES(?,?,?,?,'pending')", (login_id, body["challenge"], body["userId"], expires))
+        handler.respond(200, {"id": login_id, "loginUrl": self.config["publicBaseUrl"] + "/auth/auto/login/" + login_id, "expiresAt": expires, "intervalMs": AUTO_POLL_MS})
+
+    def _issue_session(self, db, user_id, username):
+        if db.execute("SELECT count(*) FROM sessions").fetchone()[0] >= 2000:
+            raise ApiError(429, "login_busy", "登录会话过多，请稍后再试。")
+        token, now = secrets.token_urlsafe(32), self.clock()
+        db.execute("DELETE FROM sessions WHERE key IN (SELECT key FROM sessions WHERE user_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 19)", (user_id,))
+        db.execute("INSERT INTO sessions VALUES(?,?,?,?,?)", (digest(token), user_id, username, now + SESSION_MS, now))
+        return {"token": token, **self._profile({"expires": now + SESSION_MS, "user_id": user_id, "username": username})}
+
+    def _auto_poll(self, handler, cancel=False):
+        verifier = header_token(handler, "LoginVerifier")
+        body = strict_object(read_json(handler), ("id",))
+        if not isinstance(body["id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", body["id"]):
+            raise ApiError(400, "invalid_request", "自动登录请求无效。")
+        with self.lock, self._db() as db:
+            self._cleanup(db)
+            row = db.execute("SELECT * FROM auto_logins WHERE id=?", (body["id"],)).fetchone()
+            if row is None or not hmac.compare_digest(row["challenge"], digest(verifier)):
+                raise ApiError(401, "auto_login_expired", "这次自动登录已过期或已完成，请重新发起。")
+            if cancel:
+                db.execute("DELETE FROM auto_logins WHERE id=?", (row["id"],))
+                result = {"status": "cancelled"}
+            elif row["last_poll"] and self.clock() - row["last_poll"] < AUTO_POLL_MS:
+                result = {"status": "pending", "intervalMs": AUTO_POLL_MS}
+            elif row["status"] == "pending":
+                db.execute("UPDATE auto_logins SET last_poll=? WHERE id=?", (self.clock(), row["id"]))
+                result = {"status": "pending", "intervalMs": AUTO_POLL_MS}
+            elif row["status"] == "failed":
+                db.execute("DELETE FROM auto_logins WHERE id=?", (row["id"],))
+                result = {"status": "failed", "message": row["message"]}
+            else:
+                # Recheck the callback's role proof; a public login URL alone
+                # can never collect a session. Consumption and issuance are atomic.
+                verdict = self.library_verdict(row["user_id"], refresh=False)
+                if verdict not in ("ok", "open"):
+                    result = {"status": "failed", "message": "答疑身份组校验已失效，请重新登录。"}
+                else:
+                    result = {"status": "complete", **self._issue_session(db, row["user_id"], row["username"]), "libraryAccess": verdict}
+                db.execute("DELETE FROM auto_logins WHERE id=?", (row["id"],))
+        handler.respond(200, result)
+
+    def _login(self, handler, automatic_id=None):
         state, cookie = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         with self.lock, self._db() as db:
             self._cleanup(db)
+            if automatic_id:
+                attempt = db.execute("SELECT status FROM auto_logins WHERE id=?", (automatic_id,)).fetchone()
+                if attempt is None or attempt["status"] != "pending":
+                    raise ApiError(400, "auto_login_expired", "这次登录已过期或已完成，请回到插件重新发起。")
             if db.execute("SELECT count(*) FROM states").fetchone()[0] >= 1000:
                 raise ApiError(429, "login_busy", "登录请求过多，请稍后再试。")
             db.execute("INSERT INTO states VALUES(?,?,?)", (digest(state), digest(cookie), self.clock() + STATE_MS))
+            if automatic_id:
+                db.execute("INSERT INTO auto_states VALUES(?,?)", (digest(state), automatic_id))
         location = "https://discord.com/oauth2/authorize?" + parse.urlencode({"response_type": "code", "client_id": self.config["clientId"],
             "scope": "identify " + MEMBER_SCOPE if self.gated else "identify", "state": state, "redirect_uri": self.config["publicBaseUrl"] + "/auth/callback", "prompt": "consent"})
         handler.respond(302, headers={"Location": location, "Set-Cookie": self._cookie(cookie, STATE_MS // 1000, COOKIE_NAME + "_" + state), "Referrer-Policy": "no-referrer"})
@@ -433,7 +506,19 @@ class Contributions:
                 raise ApiError(400, "invalid_oauth_state", "这次登录已过期或已经使用，请从插件重新打开登录。")
             if not hmac.compare_digest(row["cookie_hash"], digest(cookie)):
                 raise ApiError(400, "invalid_oauth_state", "当前浏览器与发起登录的浏览器不一致，或登录状态已变化，请在同一浏览器中重新打开登录。")
+            automatic = db.execute("SELECT login_id FROM auto_states WHERE state_key=?", (digest(state),)).fetchone()
+            automatic_id = automatic["login_id"] if automatic else None
             db.execute("DELETE FROM states WHERE key=?", (digest(state),))
+            db.execute("DELETE FROM auto_states WHERE state_key=?", (digest(state),))
+        try:
+            self._finish_callback(handler, fields, cookie_name, automatic_id)
+        except ApiError as exc:
+            if automatic_id:
+                with self.lock, self._db() as db:
+                    db.execute("UPDATE auto_logins SET status='failed',message=? WHERE id=? AND status='pending'", (exc.message, automatic_id))
+            raise
+
+    def _finish_callback(self, handler, fields, cookie_name, automatic_id):
         if "error" in fields:
             raise ApiError(400, "oauth_declined", "Discord 授权已取消。")
         code = fields.get("code", "")
@@ -445,15 +530,29 @@ class Contributions:
         login_code = secrets.token_urlsafe(32)
         with self.lock, self._db() as db:
             self._cleanup(db)
+            if automatic_id:
+                attempt = db.execute("SELECT * FROM auto_logins WHERE id=?", (automatic_id,)).fetchone()
+                if attempt is None or attempt["status"] != "pending":
+                    raise ApiError(400, "auto_login_expired", "这次登录已取消、过期或已完成，请回到插件重新发起。")
+                if user["id"] != attempt["expected_user"]:
+                    raise ApiError(403, "account_mismatch", "浏览器授权的 Discord 账号与插件当前账号不同，请切换到同一账号后重试。")
             if self.gated and not self._record_access(db, user["id"], user["roles"]) and user["id"] not in self.config["reviewerIds"]:
                 raise ApiError(403, "library_forbidden", "此 Discord 账号不在指定服务器，或没有答疑身份组。云端库与投稿仅对答疑成员开放，本地 QR 功能不受影响。")
-            if db.execute("SELECT count(*) FROM codes").fetchone()[0] >= 1000:
+            if automatic_id:
+                db.execute("UPDATE auto_logins SET status='authorized',user_id=?,username=? WHERE id=?", (user["id"], user["username"], automatic_id))
+            elif db.execute("SELECT count(*) FROM codes").fetchone()[0] >= 1000:
                 raise ApiError(429, "login_busy", "登录请求过多，请稍后再试。")
-            db.execute("INSERT INTO codes VALUES(?,?,?,?)", (digest(login_code), user["id"], user["username"], self.clock() + CODE_MS))
+            else:
+                db.execute("INSERT INTO codes VALUES(?,?,?,?)", (digest(login_code), user["id"], user["username"], self.clock() + CODE_MS))
         page = ('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>答疑库登录</title>'
                 '<style>body{font:18px system-ui;max-width:46em;margin:3em auto;padding:1em}code{display:block;word-break:break-all;padding:1em;background:#eee;color:#111;user-select:all}</style>'
                 '<h1>Discord 身份已验证</h1><p>将下面的一次性登录码复制回答疑插件。5 分钟内有效，只能使用一次。请勿转发给他人。</p><code>'
                 + html.escape(login_code) + '</code><p>已验证的 Discord ID：' + html.escape(user["id"]) + '</p>').encode("utf-8")
+        if automatic_id:
+            page = ('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>答疑库授权完成</title>'
+                    '<style>body{font:18px system-ui;max-width:46em;margin:3em auto;padding:1em}</style>'
+                    '<h1>授权完成</h1><p>请返回 Discord，发起登录的答疑插件会自动完成登录，无需复制登录码。可以关闭本页。</p>'
+                    '<p>已验证账号：' + html.escape(user["username"]) + '</p>').encode("utf-8")
         handler.respond(200, page, {"Set-Cookie": self._cookie(name=cookie_name), "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
             "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}, content_type="text/html; charset=utf-8")
 
@@ -639,13 +738,19 @@ class Contributions:
             return False
         try:
             if path == "/contributions/status" and handler.command == "GET" and not parsed.query:
-                handler.respond(200, {"enabled": self.enabled, "loginUrl": self.config["publicBaseUrl"] + "/auth/login"})
+                handler.respond(200, {"enabled": self.enabled, "loginUrl": self.config["publicBaseUrl"] + "/auth/login", "automaticLogin": True})
                 return True
             if not self.enabled:
                 raise ApiError(503, "contributions_disabled", "管理员尚未配置 Discord 登录，提交与审核暂未开放；共享库仍可读取。")
             if (parsed.query and path != "/auth/callback") or handler.command not in self.methods(path):
                 raise ApiError(404, "not_found", "没有这个接口。")
-            if path == "/auth/login":
+            if path == "/auth/auto/start":
+                self._auto_start(handler)
+            elif path in ("/auth/auto/poll", "/auth/auto/cancel"):
+                self._auto_poll(handler, cancel=path.endswith("/cancel"))
+            elif AUTO_LOGIN_PATH.fullmatch(path):
+                self._login(handler, AUTO_LOGIN_PATH.fullmatch(path)[1])
+            elif path == "/auth/login":
                 self._login(handler)
             elif path == "/auth/callback":
                 self._callback(handler, parsed.query)
@@ -681,7 +786,7 @@ class Contributions:
                         finally:
                             self.body_slot.release()
         except ApiError as exc:
-            if path in ("/auth/login", "/auth/callback") and "text/html" in handler.headers.get("Accept", ""):
+            if (path in ("/auth/login", "/auth/callback") or AUTO_LOGIN_PATH.fullmatch(path)) and "text/html" in handler.headers.get("Accept", ""):
                 # These are opened in a browser tab; show readable text, never JSON escapes.
                 page = ('<!doctype html><meta charset="utf-8"><title>答疑库登录</title><style>body{font:18px system-ui;max-width:46em;margin:3em auto;padding:1em}</style>'
                         '<h1>登录未完成</h1><p>' + html.escape(exc.message) + '</p>').encode("utf-8")

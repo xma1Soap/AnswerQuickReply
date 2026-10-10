@@ -114,7 +114,7 @@ class ContributionTests(unittest.TestCase):
         self.write_config()
         with self.running() as server:
             status, _, body = self.api(server, "/contributions/status")
-            self.assertEqual((status, body), (200, {"enabled": False, "loginUrl": self.config["publicBaseUrl"] + "/auth/login"}))
+            self.assertEqual((status, body), (200, {"enabled": False, "loginUrl": self.config["publicBaseUrl"] + "/auth/login", "automaticLogin": True}))
             self.assertEqual(request(server)[0], 200)
             for path, method in (("/auth/login", "GET"), ("/auth/callback?code=anything&state=anything", "GET"),
                                  ("/auth/exchange", "POST"), ("/auth/logout", "POST"), ("/contributions", "POST"),

@@ -19,10 +19,13 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export type LibraryAccess = "" | "open" | "ok" | "denied" | "recheck";
 const ACCESS_VALUES: readonly LibraryAccess[] = ["open", "ok", "denied", "recheck"];
 interface Session { token: string; expiresAt: number; user: { id: string; username: string; }; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; }
-export interface ContributionState { ready: boolean; enabled: boolean; loginUrl: string; user: Session["user"] | null; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; }
+export interface ContributionState { ready: boolean; enabled: boolean; loginUrl: string; user: Session["user"] | null; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; automaticLogin: boolean; autoLoginUrl: string; loginWaiting: boolean; }
 export interface Submission { id: string; title: string; status: "pending" | "published" | "rejected"; createdAt: number; updatedAt: number; reason?: string; submitterId?: string; }
 export interface SubmissionDetail extends Submission { entry: QREntry; }
-let state: ContributionState = { ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "" };
+let state: ContributionState = { ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", loginWaiting: false };
+interface LoginAttempt { id: string; verifier: string; userId: string; url: string; expires: number; controller: AbortController; polling?: Promise<void>; }
+let loginAttempt: LoginAttempt | undefined;
+let preparingLogin: Promise<void> | undefined;
 let session: Session | null = null;
 let pending: Record<string, string> = {};
 let active = false;
@@ -35,7 +38,7 @@ const controllers = new Set<AbortController>();
 const listeners = new Set<() => void>();
 
 export function getContributionState(): ContributionState { return state; }
-export function subscribeContributions(listener: () => void): () => void { listeners.add(listener); return () => { listeners.delete(listener); }; }
+export function subscribeContributions(listener: () => void): () => void { listeners.add(listener); return () => { listeners.delete(listener); if (!listeners.size) cancelAutomaticLogin(); }; }
 function update(patch: Partial<ContributionState>): void {
     state = Object.freeze({ ...state, ...patch });
     for (const listener of listeners) { try { listener(); } catch { /* UI does not control requests. */ } }
@@ -43,9 +46,10 @@ function update(patch: Partial<ContributionState>): void {
 function check(expected = generation): void { if (!active || expected !== generation) throw new Error("贡献操作已取消，请重新打开面板。"); }
 export function startContributions(): void { active = true; }
 export function stopContributions(): void {
+    cancelAutomaticLogin();
     active = false; generation++; busy = false; loaded = false; loading = undefined; session = null; pending = {};
     controllers.forEach(controller => controller.abort()); controllers.clear();
-    update({ ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "" });
+    update({ ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", loginWaiting: false });
 }
 function sessionFrom(value: unknown): Session {
     const s = value as Session;
@@ -119,26 +123,30 @@ async function responseJson(response: Response, signal: AbortSignal): Promise<an
         text.push(decoder.decode()); return JSON.parse(text.join(""));
     } finally { signal.removeEventListener("abort", cancel); void reader.cancel().catch(() => {}); }
 }
-async function api(endpoint: string, body?: unknown, authenticated = true, loginCode?: string): Promise<any> {
+async function api(endpoint: string, body?: unknown, authenticated = true, loginCode?: string, verifier?: string, signal?: AbortSignal): Promise<any> {
     check(); const expected = generation;
     if (authenticated && (!session || session.expiresAt <= Date.now())) { await clearSession(); throw new Error("请先登录贡献服务。"); }
     const token = authenticated ? session!.token : undefined;
     const serialized = body === undefined ? undefined : JSON.stringify(body);
     if (serialized && new TextEncoder().encode(serialized).byteLength > LIMIT) throw new Error("提交内容超过 32 MiB，请减少图片。");
     const controller = new AbortController(); controllers.add(controller);
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) controller.abort();
     const timer = setTimeout(() => controller.abort(), 30_000);
     try {
         const headers: Record<string, string> = { Accept: "application/json" };
         if (serialized) headers["Content-Type"] = "application/json";
         if (token) headers.Authorization = `Bearer ${token}`;
         if (loginCode) headers.Authorization = `LoginCode ${loginCode}`;
+        if (verifier) headers.Authorization = `LoginVerifier ${verifier}`;
         const response = await fetch(COMMUNITY_BASE + endpoint, {
             method: serialized === undefined ? "GET" : "POST", headers, body: serialized, signal: controller.signal,
             credentials: "omit", redirect: "error", referrerPolicy: "no-referrer", cache: "no-store"
         });
         check(expected);
         if (authenticated && session?.token !== token) throw new Error("登录身份已改变，请重新操作。");
-        if (response.status === 401) { await clearSession(); throw new Error("登录已过期，请重新授权。"); }
+        if (response.status === 401 && authenticated) { await clearSession(); throw new Error("登录已过期，请重新授权。"); }
         const result = await responseJson(response, controller.signal); check(expected);
         if (authenticated && session?.token !== token) throw new Error("登录身份已改变，请重新操作。");
         if (!response.ok) throw new Error(typeof result?.message === "string" ? result.message.slice(0, 500) : `贡献服务返回 HTTP ${response.status}`);
@@ -146,13 +154,13 @@ async function api(endpoint: string, body?: unknown, authenticated = true, login
     } catch (error) {
         if (controller.signal.aborted) throw new Error("贡献请求已取消或超时；提交结果不明时请使用同一条目重试。");
         throw error;
-    } finally { clearTimeout(timer); controllers.delete(controller); }
+    } finally { clearTimeout(timer); signal?.removeEventListener("abort", abort); controllers.delete(controller); }
 }
 export async function loadContributionPanel(): Promise<void> {
     const expected = generation; await loadLocal(); check(expected);
     const status = await api("/contributions/status", undefined, false);
     if (typeof status?.enabled !== "boolean" || (status.enabled && status.loginUrl !== LOGIN_URL)) throw new Error("贡献服务状态或登录地址不正确。");
-    update({ ready: true, enabled: status.enabled, loginUrl: status.enabled ? LOGIN_URL : "", canReview: false, canAutoPublish: false });
+    update({ ready: true, enabled: status.enabled, loginUrl: status.enabled ? LOGIN_URL : "", canReview: false, canAutoPublish: false, automaticLogin: status.automaticLogin === true });
     if (status.enabled && session) {
         const me = await api("/contributions/me");
         try { session = sessionFrom({ ...me, token: session!.token }); }
@@ -170,7 +178,106 @@ async function exclusive<T>(operation: () => Promise<T>): Promise<T> {
     try { const result = await operation(); check(expected); return result; }
     finally { if (expected === generation) busy = false; }
 }
+
+export function cancelAutomaticLogin(): void {
+    const attempt = loginAttempt;
+    loginAttempt = undefined; preparingLogin = undefined;
+    attempt?.controller.abort();
+    update({ autoLoginUrl: "", loginWaiting: false });
+    if (active && attempt?.id) void api("/auth/auto/cancel", { id: attempt.id }, false, undefined, attempt.verifier).catch(() => {});
+}
+
+/** Prepare a normal clickable URL before the click, avoiding popup blockers. */
+export async function prepareAutomaticLogin(userId: string | undefined): Promise<void> {
+    check();
+    if (!state.enabled || !state.automaticLogin || session) return;
+    if (!userId || !/^\d{17,20}$/.test(userId)) throw new Error("无法确定当前 Discord 账号，请重新打开登录面板。");
+    if (loginAttempt && loginAttempt.userId !== userId) cancelAutomaticLogin();
+    if (preparingLogin) return preparingLogin;
+    if (loginAttempt && loginAttempt.expires > Date.now() + 30_000) return;
+    cancelAutomaticLogin();
+    const verifier = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const attempt: LoginAttempt = { id: "", verifier, userId, url: "", expires: 0, controller: new AbortController() };
+    loginAttempt = attempt;
+    const expected = generation;
+    const task = (async () => {
+        const challenge = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)))].map(n => n.toString(16).padStart(2, "0")).join("");
+        check(expected);
+        if (loginAttempt !== attempt) throw new Error("登录已取消。");
+        const result = await api("/auth/auto/start", { challenge, userId }, false, undefined, undefined, attempt.controller.signal);
+        check(expected);
+        if (loginAttempt !== attempt) throw new Error("登录已取消。");
+        if (typeof result.id !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(result.id)
+            || result.loginUrl !== `${COMMUNITY_BASE}/auth/auto/login/${result.id}`
+            || !Number.isFinite(result.expiresAt) || result.expiresAt <= Date.now() || result.expiresAt > Date.now() + 11 * 60_000
+            || result.intervalMs !== 5000) throw new Error("自动登录服务返回了无效信息。");
+        Object.assign(attempt, { id: result.id, url: result.loginUrl, expires: result.expiresAt });
+        update({ autoLoginUrl: attempt.url });
+    })().catch(error => {
+        if (loginAttempt === attempt) cancelAutomaticLogin();
+        throw error;
+    }).finally(() => { if (preparingLogin === task) preparingLogin = undefined; });
+    preparingLogin = task;
+    return task;
+}
+
+function loginDelay(signal: AbortSignal, ms: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const abort = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); reject(new Error("登录已取消。")); };
+        const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+    });
+}
+
+export async function waitForAutomaticLogin(currentUserId: () => string | undefined): Promise<void> {
+    const attempt = loginAttempt;
+    if (!attempt?.id || attempt.expires <= Date.now()) { cancelAutomaticLogin(); throw new Error("登录链接已过期，请重新准备登录。"); }
+    if (attempt.polling) return attempt.polling;
+    const expected = generation;
+    const valid = () => {
+        check(expected);
+        if (loginAttempt !== attempt || attempt.controller.signal.aborted) throw new Error("登录已取消。");
+        if (currentUserId() !== attempt.userId) throw new Error("Discord 账号已切换，请重新登录。");
+        if (Date.now() >= attempt.expires) throw new Error("等待授权已超时，请重新登录。");
+    };
+    update({ loginWaiting: true });
+    const task = (async () => {
+        let failures = 0;
+        while (true) {
+            valid();
+            await loginDelay(attempt.controller.signal, 5000 * (failures + 1));
+            valid();
+            let result;
+            try { result = await api("/auth/auto/poll", { id: attempt.id }, false, undefined, attempt.verifier, attempt.controller.signal); }
+            catch (error) { valid(); if (++failures >= 3) throw error; continue; }
+            valid(); failures = 0;
+            if (result.status === "pending") continue;
+            if (result.status === "failed") throw new Error(typeof result.message === "string" ? result.message.slice(0, 500) : "授权未完成，请重新登录。");
+            if (result.status !== "complete") throw new Error("自动登录返回了无效状态。");
+            const next = sessionFrom(result);
+            if (next.user.id !== attempt.userId || !["ok", "open"].includes(next.libraryAccess)) throw new Error("授权账号或答疑权限与本次请求不符。");
+            // Serialize the validity checks with storage. A late HTTP response
+            // or a plugin stop/account switch must not persist a stale login.
+            const persist = writing.then(async () => {
+                valid();
+                await DataStore.set(SESSION_KEY, next);
+                try { valid(); } catch (error) { await DataStore.set(SESSION_KEY, null); throw error; }
+            });
+            writing = persist.catch(() => {});
+            await persist; valid(); session = next;
+            loginAttempt = undefined;
+            update({ user: next.user, canReview: next.canReview, canAutoPublish: next.canAutoPublish, libraryAccess: next.libraryAccess, autoLoginUrl: "", loginWaiting: false });
+            if (getRemoteState().config.url === DEFAULT_REMOTE_URL) void refreshRemoteLibrary().catch(() => {});
+            return;
+        }
+    })().finally(() => { if (loginAttempt === attempt) cancelAutomaticLogin(); });
+    attempt.polling = task;
+    return task;
+}
+
 export async function exchangeLoginCode(code: string): Promise<void> {
+    cancelAutomaticLogin();
     return exclusive(async () => {
         if (!state.enabled) throw new Error("管理员尚未开通提交。");
         const clean = code.trim(); if (!/^[\x21-\x7e]{1,256}$/.test(clean)) throw new Error("请输入有效的一次性登录码。");
@@ -181,6 +288,7 @@ export async function exchangeLoginCode(code: string): Promise<void> {
     });
 }
 export async function logoutContributions(): Promise<void> {
+    cancelAutomaticLogin();
     return exclusive(async () => {
         const expected = generation;
         try { if (session) await api("/auth/logout", {}); }

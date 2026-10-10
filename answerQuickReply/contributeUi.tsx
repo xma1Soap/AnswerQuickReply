@@ -5,9 +5,9 @@
  */
 
 import { RenderModalProps } from "@vencord/discord-types";
-import { Modal, openModal, useEffect, useRef, useState } from "@webpack/common";
+import { Modal, openModal, useEffect, useRef, UserStore, useState } from "@webpack/common";
 
-import { exchangeLoginCode, getContributionState, listSubmissions, loadContributionPanel, logoutContributions, readSubmission, reviewSubmission, snapshotContribution, Submission, SubmissionDetail, submitContribution, subscribeContributions } from "./contribute";
+import { cancelAutomaticLogin, exchangeLoginCode, getContributionState, listSubmissions, loadContributionPanel, logoutContributions, prepareAutomaticLogin, readSubmission, reviewSubmission, snapshotContribution, Submission, SubmissionDetail, submitContribution, subscribeContributions, waitForAutomaticLogin } from "./contribute";
 import { QREntry } from "./model";
 
 const statusName = { pending: "待审核", published: "已发布", rejected: "已驳回" };
@@ -51,6 +51,7 @@ function ContributionPanel({ modalProps, draft }: { modalProps: RenderModalProps
     async function refresh(wantsReview = review) {
         await loadContributionPanel();
         const current = getContributionState();
+        if (!current.user && current.automaticLogin) await prepareAutomaticLogin(UserStore.getCurrentUser()?.id);
         const allowedReview = wantsReview && current.canReview;
         const next = current.enabled && current.user ? await listSubmissions(allowedReview) : [];
         if (mounted.current) { setReview(allowedReview); setItems(next); setDetail(null); }
@@ -71,12 +72,31 @@ function ContributionPanel({ modalProps, draft }: { modalProps: RenderModalProps
             {!service.ready ? <p>{busy ? "正在检查贡献服务…" : "暂时无法读取贡献服务状态。"}</p>
                 : !service.enabled ? <p className="aqr-banner is-info">管理员尚未开通 Discord 登录，社区云端库与投稿暂不可用；本地 QR 不受影响。</p>
                     : !service.user ? <section className="aqr-remote-connection">
-                        <p>在浏览器完成 Discord 授权（读取你的用户名，以及你在答疑服务器中的身份组），再把页面上的一次性登录码填在这里。登录码有效期 5 分钟。没有答疑身份组的账号不会获得登录码。</p>
-                        <a className="aqr-link" href={service.loginUrl} target="_blank" rel="noopener noreferrer">打开 Discord 身份授权</a>
+                        <p>在浏览器授权当前 Discord 账号，完成后插件会自动登录，无需复制登录码。授权只读取用户名和答疑服务器中的身份组。</p>
+                        {service.automaticLogin && <>
+                            {service.autoLoginUrl ? <a className="aqr-btn aqr-btn--primary" href={service.autoLoginUrl} target="_blank" rel="noopener noreferrer" onClick={e => {
+                                if (running.current) { e.preventDefault(); return; }
+                                void run(async () => {
+                                    await waitForAutomaticLogin(() => UserStore.getCurrentUser()?.id);
+                                    if (mounted.current) setNotice("Discord 授权成功，已自动登录。");
+                                    await refresh(false);
+                                });
+                            }}>{service.loginWaiting ? "正在等待浏览器授权…" : "使用 Discord 登录"}</a>
+                                : <button type="button" className="aqr-btn" disabled={busy} onClick={() => void run(() => refresh(false))}>准备登录</button>}
+                            {service.loginWaiting && <div role="status">
+                                <p>请在浏览器完成授权，保留此面板。授权后通常 5 秒内登录。</p>
+                                <a className="aqr-link" href={service.autoLoginUrl} target="_blank" rel="noopener noreferrer">重新打开授权页面</a>
+                                <button type="button" className="aqr-btn" onClick={cancelAutomaticLogin}>取消登录</button>
+                            </div>}
+                        </>}
+                        <details open={!service.automaticLogin}><summary>使用一次性登录码（兼容旧版）</summary>
+                        <p>仅兼容方式需要复制登录码；登录码 5 分钟有效。</p>
+                        <a className="aqr-link" href={service.loginUrl} target="_blank" rel="noopener noreferrer">打开手动授权页面</a>
                         <label>一次性登录码<input autoComplete="off" type="password" value={code} maxLength={256} disabled={busy} onChange={e => setCode(e.currentTarget.value)} /></label>
                         <button type="button" className="aqr-btn aqr-btn--primary" disabled={busy || !code.trim()} onClick={() => void run(async () => {
                             await exchangeLoginCode(code); if (mounted.current) setCode(""); await refresh(false);
                         })}>兑换登录码</button>
+                        </details>
                         <small>不读取 Discord 客户端 token。贡献会话只保存在本机，不进入 QR 备份。</small>
                     </section> : <>
                         <div className="aqr-remote-actions">
