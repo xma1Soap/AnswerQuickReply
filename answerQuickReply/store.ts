@@ -105,6 +105,16 @@ export async function saveEntry(entry: QREntry): Promise<void> {
     });
 }
 
+/** Change only the live entry's star; an old menu must not restore deleted or edited content. */
+export function setEntryFavorite(id: string, favorite: boolean): Promise<void> {
+    return enqueue(async () => {
+        const current = entries.find(entry => entry.id === id);
+        if (!current) throw new Error("这条本地 QR 已删除，请重新打开答疑库。");
+        if (current.favorite === favorite) return;
+        await persist(entries.map(entry => entry.id === id ? { ...entry, favorite, updatedAt: Date.now() } : entry));
+    });
+}
+
 export function deleteEntry(id: string): Promise<void> {
     return enqueue(async () => {
         if (entries.some(entry => entry.id === id)) await persist(entries.filter(entry => entry.id !== id));

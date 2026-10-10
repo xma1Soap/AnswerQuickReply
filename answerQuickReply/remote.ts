@@ -6,7 +6,8 @@
 
 import * as DataStore from "@api/DataStore";
 
-import { getLibrarySessionToken, invalidateLibrarySession } from "./contribute";
+import { getContributionState, getLibrarySessionToken, invalidateLibrarySession } from "./contribute";
+import { isRemoteFavorite, RemoteFavoriteScope, setRemoteFavorite } from "./favorites";
 import { parseArchive, QR_LIMITS, QREntry, validateEntry } from "./model";
 import { copyEntriesLocally, saveEntry } from "./store";
 
@@ -71,6 +72,39 @@ export function validateRemoteConfig(value: unknown): Readonly<RemoteConfig> {
 }
 
 export function getRemoteState(): RemoteState { return state; }
+export function getRemoteFavoriteScope(): RemoteFavoriteScope | undefined {
+    if (!active || !state.ready || state.saving) return;
+    if (state.config.url !== DEFAULT_REMOTE_URL) return { libraryUrl: state.config.url, userId: "custom" };
+    const session = getContributionState();
+    if (!session.user || session.expiresAt <= Date.now() || session.libraryAccess === "denied" || session.libraryAccess === "recheck") return;
+    return { libraryUrl: state.config.url, userId: session.user.id };
+}
+/** Personal stars overlay immutable downloaded entries; cloud edit versions never change. */
+export function getPersonalRemoteEntries(): QREntry[] {
+    const scope = getRemoteFavoriteScope();
+    if (!scope) return emptyEntries;
+    return state.entries.map(entry => Object.freeze({ ...entry, favorite: isRemoteFavorite(scope, entry.id) }));
+}
+function sameScope(scope: RemoteFavoriteScope): boolean {
+    const current = getRemoteFavoriteScope();
+    return !!current && current.libraryUrl === scope.libraryUrl && current.userId === scope.userId;
+}
+export async function saveRemoteFavorite(scope: RemoteFavoriteScope, id: string, favorite: boolean): Promise<void> {
+    assertActive();
+    if (!sameScope(scope) || !state.entries.some(entry => entry.id === id)) throw new Error("云端连接或登录已改变，请重新打开答疑库。");
+    await setRemoteFavorite(scope, id, favorite);
+}
+/** Resolve again at the click, so a menu opened before logout cannot send its old cloud snapshot. */
+export async function resolveRemoteEntry(scope: RemoteFavoriteScope, id: string): Promise<QREntry> {
+    assertActive();
+    const expected = generation;
+    if (!sameScope(scope)) throw new Error("云端连接或登录已改变，请重新打开答疑库。");
+    if (scope.libraryUrl === DEFAULT_REMOTE_URL && !await getLibrarySessionToken()) throw new Error(LOGIN_HINT);
+    if (!active || expected !== generation || !sameScope(scope)) throw new Error("云端连接或登录已改变，请重新打开答疑库。");
+    const entry = state.entries.find(entry => entry.id === id);
+    if (!entry) throw new Error("这条云端 QR 已不可用，请重新获取答疑库。");
+    return Object.freeze({ ...entry, favorite: isRemoteFavorite(scope, id) });
+}
 export function subscribeRemote(listener: () => void): () => void {
     listeners.add(listener);
     return () => { listeners.delete(listener); };

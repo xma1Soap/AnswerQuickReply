@@ -5,18 +5,19 @@
  */
 
 import { Message, MessageAttachment, RenderModalProps } from "@vencord/discord-types";
-import { ChannelStore, closeAllModals, ConfirmModal, MessageActions, Modal, NavigationRouter, openModal, Parser, SelectedChannelStore, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "@webpack/common";
+import { ChannelStore, closeAllModals, ConfirmModal, ContextMenuApi, Menu, MessageActions, Modal, NavigationRouter, openModal, Parser, SelectedChannelStore, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "@webpack/common";
 
 import { errorText, fileToImage, imageAttachments, imageTools, recognizeAttachment } from "./bridge";
-import { CloudUpdate, getContributionState, loadContributionPanel, snapshotContribution, submitContribution } from "./contribute";
+import { CloudUpdate, getContributionState, loadContributionPanel, snapshotContribution, submitContribution, subscribeContributions } from "./contribute";
 import { openContributions } from "./contributeUi";
+import { loadRemoteFavorites, subscribeRemoteFavorites } from "./favorites";
 import { Icon, IconName } from "./icons";
 import { matchEntries, normalizeText, QR_LIMITS, QREntry, QRImage, QRMatch, searchEntries } from "./model";
 import { showQrToast } from "./notify";
-import { DEFAULT_REMOTE_URL, ensureRemoteLibrary, getRemoteState, loadRemoteConfig, refreshRemoteLibrary, saveRemoteConfig, saveRemoteEntriesLocally, saveRemoteEntryLocally, subscribeRemote } from "./remote";
+import { DEFAULT_REMOTE_URL, ensureRemoteLibrary, getPersonalRemoteEntries, getRemoteFavoriteScope, getRemoteState, loadRemoteConfig, refreshRemoteLibrary, resolveRemoteEntry, saveRemoteConfig, saveRemoteEntriesLocally, saveRemoteEntryLocally, saveRemoteFavorite, subscribeRemote } from "./remote";
 import { sendReply } from "./send";
 import { settings } from "./settings";
-import { deleteEntry, exportLibrary, getEntries, importLibrary, loadLibrary, saveEntry, subscribe } from "./store";
+import { deleteEntry, exportLibrary, getEntries, importLibrary, loadLibrary, saveEntry, setEntryFavorite, subscribe } from "./store";
 import { ReplyTarget, snapshotReplyTarget } from "./target";
 
 /* ───────────────────────────── helpers ───────────────────────────── */
@@ -133,12 +134,28 @@ function useLibrary() {
 
 function useRemoteLibrary() {
     const [remote, setRemote] = useState(getRemoteState);
+    const expiresAt = getContributionState().expiresAt;
     useEffect(() => {
         const unsubscribe = subscribeRemote(() => setRemote(getRemoteState()));
+        const changed = () => setRemote({ ...getRemoteState() });
+        const unsubscribeFavorites = subscribeRemoteFavorites(changed);
+        const unsubscribeSession = subscribeContributions(changed);
         loadRemoteConfig().catch(() => {});
-        return unsubscribe;
+        loadRemoteFavorites().catch(() => {});
+        return () => { unsubscribe(); unsubscribeFavorites(); unsubscribeSession(); };
     }, []);
-    return remote;
+    useEffect(() => {
+        if (expiresAt <= Date.now()) return;
+        let timer: ReturnType<typeof setTimeout>;
+        const expire = () => {
+            const remaining = expiresAt - Date.now();
+            if (remaining > 0) timer = setTimeout(expire, Math.min(remaining, 2_147_483_647));
+            else setRemote({ ...getRemoteState() });
+        };
+        expire();
+        return () => clearTimeout(timer);
+    }, [expiresAt]);
+    return { ...remote, entries: getPersonalRemoteEntries() };
 }
 
 /* ─────────────────────────── primitives ─────────────────────────── */
@@ -272,7 +289,10 @@ export function openEditor(entry = blankEntry()) {
 
 async function openCloudEditor(entry: QREntry) {
     try {
-        const snapshot = snapshotContribution(entry);
+        const original = getRemoteState().entries.find(item => item.id === entry.id && item.updatedAt === entry.updatedAt);
+        if (!original) throw new Error("这条云端 QR 已更新，请重新获取后编辑。");
+        // Personal stars must never become a shared cloud edit.
+        const snapshot = snapshotContribution({ ...entry, favorite: original.favorite });
         await loadContributionPanel();
         const service = getContributionState();
         if (!service.user) { openContributions(); showQrToast("请先登录，再选择云端条目编辑。"); return; }
@@ -597,9 +617,9 @@ function Editor({ modalProps, entry, cloudUpdate }: { modalProps: RenderModalPro
 
 /* ──────────────────────────── library ──────────────────────────── */
 
-export function openLibrary(source?: Message | ReplyTarget, startOcr = false, initialQuery = "") {
+export function openLibrary(source?: Message | ReplyTarget, startOcr = false, initialQuery = "", initialSource?: "local" | "remote") {
     const message = source && snapshotReplyTarget(source);
-    openModal(props => <Library modalProps={props} message={message} startOcr={startOcr} initialQuery={initialQuery} />);
+    openModal(props => <Library modalProps={props} message={message} startOcr={startOcr} initialQuery={initialQuery} initialSource={initialSource} />);
 }
 
 function downloadBackup() {
@@ -614,14 +634,15 @@ function downloadBackup() {
 type Tab = "match" | "fav" | "all";
 interface Snack { id: number; text: string; tone: "info" | "positive"; undo?: QREntry; }
 
-function Library({ modalProps, message, startOcr, initialQuery = "" }: { modalProps: RenderModalProps; message?: ReplyTarget; startOcr: boolean; initialQuery?: string; }) {
+function Library({ modalProps, message, startOcr, initialQuery = "", initialSource }: { modalProps: RenderModalProps; message?: ReplyTarget; startOcr: boolean; initialQuery?: string; initialSource?: "local" | "remote"; }) {
     const { entries: localEntries, error: loadError } = useLibrary();
     const remote = useRemoteLibrary();
-    const [source, setSource] = useState<"local" | "remote">(message && !initialQuery ? "remote" : "local");
+    const [source, setSource] = useState<"local" | "remote">(initialSource ?? (message && !initialQuery ? "remote" : "local"));
     const [showConnection, setShowConnection] = useState(false);
     const [copying, setCopying] = useState("");
     const copyRunning = useRef(false);
     const readOnly = source === "remote";
+    const remoteScope = getRemoteFavoriteScope();
     const entries = readOnly ? remote.entries : localEntries;
     const [query, setQuery] = useState(initialQuery);
     const [tab, setTab] = useState<Tab | null>(null);
@@ -669,7 +690,7 @@ function Library({ modalProps, message, startOcr, initialQuery = "" }: { modalPr
 
     const tabs: SegmentOption<Tab>[] = [
         ...(message ? [{ value: "match" as const, label: "推荐", count: matches.length }] : []),
-        { value: "fav", label: readOnly ? "库中标星" : "收藏", count: favorites.length },
+        { value: "fav", label: "收藏", count: favorites.length },
         { value: "all", label: "全部", count: entries.length }
     ];
 
@@ -711,7 +732,11 @@ function Library({ modalProps, message, startOcr, initialQuery = "" }: { modalPr
         if (!message || sending) return;
         setSending(entry.id);
         setError("");
-        try { await sendReply(entry, message, mention); modalProps.onClose(); showQrToast("答疑 QR 已发送", "success"); }
+        try {
+            if (readOnly && !remoteScope) throw new Error("请先登录并重新获取云端答疑库。");
+            const current = readOnly ? await resolveRemoteEntry(remoteScope!, entry.id) : entry;
+            await sendReply(current, message, mention); modalProps.onClose(); showQrToast("答疑 QR 已发送", "success");
+        }
         catch (e) { setError(errorText(e)); }
         finally { if (mounted.current) setSending(""); }
     }
@@ -766,8 +791,11 @@ function Library({ modalProps, message, startOcr, initialQuery = "" }: { modalPr
     }
 
     function toggleFavorite(entry: QREntry) {
-        if (readOnly) return;
-        saveEntry({ ...entry, favorite: !entry.favorite, updatedAt: Date.now() }).catch(e => setError(errorText(e)));
+        if (sending || copying) return;
+        if (readOnly && !remoteScope) { setError("请先登录并重新获取云端答疑库。"); return; }
+        const task = readOnly ? saveRemoteFavorite(remoteScope!, entry.id, !entry.favorite)
+            : setEntryFavorite(entry.id, !entry.favorite);
+        task.catch(e => { if (mounted.current) setError(errorText(e)); });
     }
 
     function onSearchKey(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -922,6 +950,7 @@ function Library({ modalProps, message, startOcr, initialQuery = "" }: { modalPr
                             leaving={leaving.has(entry.id)}
                             disabled={!!sending || !!copying}
                             onSelect={() => { setSelectedId(entry.id); searchRef.current?.focus({ preventScroll: true }); }}
+                            onFavorite={() => toggleFavorite(entry)}
                             onDelete={readOnly ? undefined : () => remove(entry)}
                         />)}
                         {!visible.length && <div className="aqr-list-empty">
@@ -982,10 +1011,11 @@ interface RowProps {
     leaving: boolean;
     disabled: boolean;
     onSelect(): void;
+    onFavorite(): void;
     onDelete?(): void;
 }
 
-function Row({ entry, index, match, selected, leaving, disabled, onSelect, onDelete }: RowProps) {
+function Row({ entry, index, match, selected, leaving, disabled, onSelect, onFavorite, onDelete }: RowProps) {
     const strong = !!match && match.score >= 100;
     const preview = plainPreview(entry);
     return <div
@@ -996,6 +1026,13 @@ function Row({ entry, index, match, selected, leaving, disabled, onSelect, onDel
         style={cssVars({ "--i": Math.min(index, 14) })}
         onMouseDown={e => e.preventDefault()}
         onClick={onSelect}
+        onContextMenu={event => {
+            event.preventDefault(); event.stopPropagation();
+            if (disabled || leaving) return;
+            ContextMenuApi.openContextMenu(event, () => <Menu.Menu navId={`aqr-entry-${entry.id}`} onClose={ContextMenuApi.closeContextMenu} aria-label="答疑 QR 收藏">
+                <Menu.MenuItem id="aqr-toggle-favorite" label={entry.favorite ? "取消收藏" : "收藏"} action={onFavorite} />
+            </Menu.Menu>);
+        }}
     >
         <div className="aqr-row-clip">
             <div className="aqr-row-body">
@@ -1054,14 +1091,16 @@ function Detail({ entry, match, message, mention, sending, busy, readOnly, canEd
             </div>
             <div className="aqr-detail-tools">
                 {canEditCloud && <Button icon="edit" size="sm" disabled={busy} onClick={onEdit}>编辑云端</Button>}
-                {readOnly ? <Button icon="import" size="sm" loading={copying} disabled={busy && !copying} onClick={onSaveLocal}>保存到本地</Button> : <><Button
+                <Button
                     variant="ghost" size="sm"
                     className={cx("aqr-fav", entry.favorite && "is-on")}
                     aria-pressed={entry.favorite}
                     title={entry.favorite ? "取消收藏" : "收藏到右键菜单"}
                     aria-label={entry.favorite ? "取消收藏" : "收藏"}
+                    disabled={busy}
                     onClick={onFavorite}
                 ><span key={String(entry.favorite)} className="aqr-fav-icon"><Icon name="star" filled={entry.favorite} /></span></Button>
+                {readOnly ? <Button icon="import" size="sm" loading={copying} disabled={busy && !copying} onClick={onSaveLocal}>保存到本地</Button> : <>
                 <Button variant="ghost" size="sm" icon="edit" title="编辑" aria-label="编辑" onClick={onEdit} />
                 <Button variant="ghost" size="sm" icon="trash" title="删除（可撤销）" aria-label="删除" className="aqr-btn--danger-hover" disabled={busy} onClick={onDelete} />
                 <Button size="sm" disabled={busy} onClick={() => openContributions(entry)}>提交到云端</Button>
