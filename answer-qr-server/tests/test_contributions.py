@@ -114,7 +114,7 @@ class ContributionTests(unittest.TestCase):
         self.write_config()
         with self.running() as server:
             status, _, body = self.api(server, "/contributions/status")
-            self.assertEqual((status, body), (200, {"enabled": False, "loginUrl": self.config["publicBaseUrl"] + "/auth/login", "automaticLogin": True, "cloudEditing": True}))
+            self.assertEqual((status, body), (200, {"enabled": False, "loginUrl": self.config["publicBaseUrl"] + "/auth/login", "automaticLogin": True, "pairing": True, "cloudEditing": True}))
             self.assertEqual(request(server)[0], 200)
             for path, method in (("/auth/login", "GET"), ("/auth/callback?code=anything&state=anything", "GET"),
                                  ("/auth/exchange", "POST"), ("/auth/logout", "POST"), ("/contributions", "POST"),
@@ -583,7 +583,9 @@ class ContributionTests(unittest.TestCase):
             for _ in range(11):
                 self.now += 1
                 self.assertEqual(self.submit(server, admin)[0][0], 200)
-            self.assertEqual(len(list((self.root / "publish-backups").glob("*.json"))), 10)
+            retained = list((self.root / "publish-backups").glob("*.json"))
+            self.assertEqual(len(retained), 11)  # ten newest plus the day's first clean baseline
+            self.assertTrue(any(path.read_bytes() == EMPTY_ARCHIVE for path in retained))
             self.assertEqual((manual / "manual.json").read_bytes(), EMPTY_ARCHIVE)
 
     def test_configure_oauth_preserves_roles_and_does_not_overwrite_invalid_input(self):

@@ -317,10 +317,10 @@ class UpdateTests(unittest.TestCase):
         self.destination.write_bytes(EMPTY_ARCHIVE)
         self.source.write_bytes(raw_archive([entry()]))
         original = os.replace
-        def fail_destination(source, destination):
+        def fail_destination(source, destination, **kwargs):
             if Path(destination) == self.destination:
                 raise OSError("simulated filesystem failure")
-            return original(source, destination)
+            return original(source, destination, **kwargs)
         with patch("update_library.os.replace", side_effect=fail_destination), self.assertRaises(OSError):
             update_library(self.source, self.destination)
         self.assertEqual(self.destination.read_bytes(), EMPTY_ARCHIVE)

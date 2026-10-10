@@ -14,16 +14,17 @@ const LOGIN_URL = `${COMMUNITY_BASE}/auth/login`;
 const SESSION_KEY = "AnswerQuickReply_contribution_session_v1";
 const PENDING_KEY = "AnswerQuickReply_contribution_pending_v1";
 const LIMIT = 32 * 1024 * 1024;
+const DETAIL_LIMIT = 64 * 1024 * 1024; // An edit detail may contain both bounded old and proposed images.
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Server verdict for the community library: open (not gated), ok, denied (no role), recheck (log in again). */
 export type LibraryAccess = "" | "open" | "ok" | "denied" | "recheck";
 const ACCESS_VALUES: readonly LibraryAccess[] = ["open", "ok", "denied", "recheck"];
 interface Session { token: string; expiresAt: number; user: { id: string; username: string; }; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; }
-export interface ContributionState { ready: boolean; enabled: boolean; loginUrl: string; user: Session["user"] | null; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; automaticLogin: boolean; autoLoginUrl: string; loginWaiting: boolean; cloudEditing: boolean; }
+export interface ContributionState { ready: boolean; enabled: boolean; loginUrl: string; user: Session["user"] | null; canReview: boolean; canAutoPublish: boolean; libraryAccess: LibraryAccess; automaticLogin: boolean; autoLoginUrl: string; pairCode: string; loginWaiting: boolean; cloudEditing: boolean; expiresAt: number; }
 export interface CloudUpdate { targetId: string; baseUpdatedAt: number; }
 export interface Submission { id: string; title: string; status: "pending" | "published" | "rejected"; createdAt: number; updatedAt: number; reason?: string; submitterId?: string; update?: CloudUpdate; }
-export interface SubmissionDetail extends Submission { entry: QREntry; }
-let state: ContributionState = { ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", loginWaiting: false, cloudEditing: false };
+export interface SubmissionDetail extends Submission { entry: QREntry; current?: QREntry | null; }
+let state: ContributionState = { ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", pairCode: "", loginWaiting: false, cloudEditing: false, expiresAt: 0 };
 interface LoginAttempt { id: string; verifier: string; userId: string; url: string; expires: number; controller: AbortController; polling?: Promise<void>; }
 let loginAttempt: LoginAttempt | undefined;
 let preparingLogin: Promise<void> | undefined;
@@ -50,7 +51,7 @@ export function stopContributions(): void {
     cancelAutomaticLogin();
     active = false; generation++; busy = false; loaded = false; loading = undefined; session = null; pending = {};
     controllers.forEach(controller => controller.abort()); controllers.clear();
-    update({ ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", loginWaiting: false, cloudEditing: false });
+    update({ ready: false, enabled: false, loginUrl: "", user: null, canReview: false, canAutoPublish: false, libraryAccess: "", automaticLogin: false, autoLoginUrl: "", pairCode: "", loginWaiting: false, cloudEditing: false, expiresAt: 0 });
 }
 function sessionFrom(value: unknown): Session {
     const s = value as Session;
@@ -66,7 +67,7 @@ function write(key: string, value: unknown): Promise<void> {
     return task;
 }
 async function clearSession(clearLibrary = true): Promise<void> {
-    session = null; update({ user: null, canReview: false, canAutoPublish: false, libraryAccess: "" });
+    session = null; update({ user: null, canReview: false, canAutoPublish: false, libraryAccess: "", expiresAt: 0 });
     // The community library is only readable while logged in; drop its cached copy too.
     if (clearLibrary) clearRemoteCache();
     await write(SESSION_KEY, null);
@@ -97,14 +98,14 @@ async function loadLocal(): Promise<void> {
         loaded = true;
         // Capabilities are deliberately not trusted from local storage. /me
         // must confirm them whenever the contribution panel is opened.
-        update({ user: session?.user ?? null, canReview: false, canAutoPublish: false, libraryAccess: "" });
+        update({ user: session?.user ?? null, canReview: false, canAutoPublish: false, libraryAccess: "", expiresAt: session?.expiresAt ?? 0 });
     }).finally(() => { if (loading === task) loading = undefined; });
     loading = task; writing = task.catch(() => {}); return task;
 }
-async function responseJson(response: Response, signal: AbortSignal): Promise<any> {
+async function responseJson(response: Response, signal: AbortSignal, limit = LIMIT): Promise<any> {
     if (!/^application\/(?:[\w.+-]+\+)?json(?:\s*;|$)/i.test(response.headers.get("content-type") ?? "")) throw new Error("贡献服务返回的不是 JSON。");
     if (response.redirected) throw new Error("贡献服务不能重定向请求。");
-    if (Number(response.headers.get("content-length") || 0) > LIMIT) throw new Error("贡献响应超过 32 MiB。");
+    if (Number(response.headers.get("content-length") || 0) > limit) throw new Error("贡献响应超过大小上限。");
     const reader = response.body?.getReader();
     if (!reader) throw new Error("客户端不支持贡献服务所需的流式读取。");
     let size = 0;
@@ -118,7 +119,7 @@ async function responseJson(response: Response, signal: AbortSignal): Promise<an
             if (signal.aborted) throw new Error("贡献请求已取消或超时。");
             if (done) break;
             size += value.byteLength;
-            if (size > LIMIT) throw new Error("贡献响应超过 32 MiB。");
+            if (size > limit) throw new Error("贡献响应超过大小上限。");
             text.push(decoder.decode(value, { stream: true }));
         }
         text.push(decoder.decode()); return JSON.parse(text.join(""));
@@ -148,7 +149,8 @@ async function api(endpoint: string, body?: unknown, authenticated = true, login
         check(expected);
         if (authenticated && session?.token !== token) throw new Error("登录身份已改变，请重新操作。");
         if (response.status === 401 && authenticated) { await clearSession(); throw new Error("登录已过期，请重新授权。"); }
-        const result = await responseJson(response, controller.signal); check(expected);
+        const limit = /^\/contributions\/[0-9a-f-]{36}$/i.test(endpoint) ? DETAIL_LIMIT : LIMIT;
+        const result = await responseJson(response, controller.signal, limit); check(expected);
         if (authenticated && session?.token !== token) throw new Error("登录身份已改变，请重新操作。");
         if (!response.ok) throw new Error(typeof result?.message === "string" ? result.message.slice(0, 500) : `贡献服务返回 HTTP ${response.status}`);
         return result;
@@ -161,7 +163,8 @@ export async function loadContributionPanel(): Promise<void> {
     const expected = generation; await loadLocal(); check(expected);
     const status = await api("/contributions/status", undefined, false);
     if (typeof status?.enabled !== "boolean" || (status.enabled && status.loginUrl !== LOGIN_URL)) throw new Error("贡献服务状态或登录地址不正确。");
-    update({ ready: true, enabled: status.enabled, loginUrl: status.enabled ? LOGIN_URL : "", canReview: false, canAutoPublish: false, automaticLogin: status.automaticLogin === true, cloudEditing: status.cloudEditing === true });
+    update({ ready: true, enabled: status.enabled, loginUrl: status.enabled ? LOGIN_URL : "", canReview: false, canAutoPublish: false, automaticLogin: status.automaticLogin === true && status.pairing === true, cloudEditing: status.cloudEditing === true });
+    if (!state.automaticLogin) cancelAutomaticLogin();
     if (status.enabled && session) {
         const me = await api("/contributions/me");
         try { session = sessionFrom({ ...me, token: session!.token }); }
@@ -170,7 +173,7 @@ export async function loadContributionPanel(): Promise<void> {
             await clearSession();
             throw new Error("需要重新用 Discord 登录，以复查答疑身份组。");
         }
-        update({ user: session.user, canReview: session.canReview, canAutoPublish: session.canAutoPublish, libraryAccess: session.libraryAccess });
+        update({ user: session.user, canReview: session.canReview, canAutoPublish: session.canAutoPublish, libraryAccess: session.libraryAccess, expiresAt: session.expiresAt });
     }
 }
 async function exclusive<T>(operation: () => Promise<T>): Promise<T> {
@@ -184,7 +187,7 @@ export function cancelAutomaticLogin(): void {
     const attempt = loginAttempt;
     loginAttempt = undefined; preparingLogin = undefined;
     attempt?.controller.abort();
-    update({ autoLoginUrl: "", loginWaiting: false });
+    update({ autoLoginUrl: "", pairCode: "", loginWaiting: false });
     if (active && attempt?.id) void api("/auth/auto/cancel", { id: attempt.id }, false, undefined, attempt.verifier).catch(() => {});
 }
 
@@ -205,15 +208,15 @@ export async function prepareAutomaticLogin(userId: string | undefined): Promise
         const challenge = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)))].map(n => n.toString(16).padStart(2, "0")).join("");
         check(expected);
         if (loginAttempt !== attempt) throw new Error("登录已取消。");
-        const result = await api("/auth/auto/start", { challenge, userId }, false, undefined, undefined, attempt.controller.signal);
+        const result = await api("/auth/auto/start", { challenge, userId, pairing: 1 }, false, undefined, undefined, attempt.controller.signal);
         check(expected);
         if (loginAttempt !== attempt) throw new Error("登录已取消。");
         if (typeof result.id !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(result.id)
             || result.loginUrl !== `${COMMUNITY_BASE}/auth/auto/login/${result.id}`
             || !Number.isFinite(result.expiresAt) || result.expiresAt <= Date.now() || result.expiresAt > Date.now() + 11 * 60_000
-            || result.intervalMs !== 5000) throw new Error("自动登录服务返回了无效信息。");
+            || result.intervalMs !== 5000 || typeof result.pairCode !== "string" || !/^\d{4}$/.test(result.pairCode)) throw new Error("自动登录服务返回了无效信息。");
         Object.assign(attempt, { id: result.id, url: result.loginUrl, expires: result.expiresAt });
-        update({ autoLoginUrl: attempt.url });
+        update({ autoLoginUrl: attempt.url, pairCode: result.pairCode });
     })().catch(error => {
         if (loginAttempt === attempt) cancelAutomaticLogin();
         throw error;
@@ -268,7 +271,7 @@ export async function waitForAutomaticLogin(currentUserId: () => string | undefi
             writing = persist.catch(() => {});
             await persist; valid(); session = next;
             loginAttempt = undefined;
-            update({ user: next.user, canReview: next.canReview, canAutoPublish: next.canAutoPublish, libraryAccess: next.libraryAccess, autoLoginUrl: "", loginWaiting: false });
+            update({ user: next.user, canReview: next.canReview, canAutoPublish: next.canAutoPublish, libraryAccess: next.libraryAccess, expiresAt: next.expiresAt, autoLoginUrl: "", pairCode: "", loginWaiting: false });
             if (getRemoteState().config.url === DEFAULT_REMOTE_URL) void refreshRemoteLibrary().catch(() => {});
             return;
         }
@@ -284,7 +287,7 @@ export async function exchangeLoginCode(code: string): Promise<void> {
         const clean = code.trim(); if (!/^[\x21-\x7e]{1,256}$/.test(clean)) throw new Error("请输入有效的一次性登录码。");
         const next = sessionFrom(await api("/auth/exchange", {}, false, clean));
         const expected = generation; await write(SESSION_KEY, next); check(expected); session = next;
-        update({ user: next.user, canReview: next.canReview, canAutoPublish: next.canAutoPublish, libraryAccess: next.libraryAccess });
+        update({ user: next.user, canReview: next.canReview, canAutoPublish: next.canAutoPublish, libraryAccess: next.libraryAccess, expiresAt: next.expiresAt });
         if (getRemoteState().config.url === DEFAULT_REMOTE_URL) void refreshRemoteLibrary().catch(() => {});
     });
 }
@@ -294,6 +297,15 @@ export async function logoutContributions(): Promise<void> {
         const expected = generation;
         try { if (session) await api("/auth/logout", {}); }
         finally { if (active && expected === generation) await clearSession(); }
+    });
+}
+export async function logoutAllContributions(): Promise<void> {
+    cancelAutomaticLogin();
+    return exclusive(async () => {
+        // Keep the session on network failure so the user can retry global revocation.
+        // A 401 still clears the expired local session through api().
+        if (session) await api("/auth/logout-all", {});
+        await clearSession();
     });
 }
 export function snapshotContribution(entry: QREntry): QREntry {
@@ -323,7 +335,10 @@ export async function readSubmission(id: string): Promise<SubmissionDetail> {
     const result = await api(`/contributions/${id}`);
     const record = summary(result?.submission);
     if (record.id !== id) throw new Error("提交详情 ID 不匹配。");
-    return { ...record, entry: snapshotContribution(result.submission.entry) };
+    const current = state.canReview && record.update && result.submission.current !== undefined
+        ? result.submission.current === null ? null : snapshotContribution(result.submission.current) : undefined;
+    if (current && current.id !== record.update!.targetId) throw new Error("当前云端版本与修改目标不匹配。");
+    return { ...record, entry: snapshotContribution(result.submission.entry), ...(current === undefined ? {} : { current }) };
 }
 export async function submitContribution(entry: QREntry, update?: CloudUpdate): Promise<{ id: string; status: "pending" | "published"; }> {
     const snapshot = snapshotContribution(entry);

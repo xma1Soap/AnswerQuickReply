@@ -22,8 +22,8 @@ function fixture() {
     const handlers = {};
     const complete = () => ({ status: 'complete', token: 'x'.repeat(43), expiresAt: now + 3600000, user: { id: USER, username: 'tester' }, canReview: false, canAutoPublish: false, libraryAccess: 'ok' });
     const defaultHandler = (url, options) => {
-        if (url.endsWith('/status')) return response({ enabled: true, loginUrl: BASE + '/auth/login', automaticLogin: true });
-        if (url.endsWith('/auto/start')) return response({ id: 'a'.repeat(43), loginUrl: BASE + '/auth/auto/login/' + 'a'.repeat(43), expiresAt: now + 600000, intervalMs: 5000 });
+        if (url.endsWith('/status')) return response({ enabled: true, loginUrl: BASE + '/auth/login', automaticLogin: true, pairing: true });
+        if (url.endsWith('/auto/start')) return response({ id: 'a'.repeat(43), loginUrl: BASE + '/auth/auto/login/' + 'a'.repeat(43), pairCode: '0042', expiresAt: now + 600000, intervalMs: 5000 });
         if (url.endsWith('/auto/cancel')) return response({ status: 'cancelled' });
         if (url.endsWith('/auto/poll')) return response(result);
         throw Error('Unexpected network request: ' + url);
@@ -52,6 +52,9 @@ function fixture() {
         const f = fixture(); await f.prepare();
         const start = f.requests.find(r => r.url.endsWith('/start'));
         const challenge = JSON.parse(start.options.body).challenge;
+        assert.equal(JSON.parse(start.options.body).pairing, 1);
+        assert.equal(f.api.getContributionState().pairCode, '0042', 'leading zero pairing code is shown in the plugin');
+        assert(!f.api.getContributionState().autoLoginUrl.includes('0042'), 'pair code is never put into the browser URL');
         assert.equal(f.store.size, 0, 'login proof is never persisted');
         const first = f.wait(), second = f.wait();
         await f.advance();
@@ -65,11 +68,13 @@ function fixture() {
         assert.equal(f.api.getContributionState().user.id, USER);
         assert.equal(f.store.get(SESSION).token, 'x'.repeat(43)); assert.equal(f.refreshes(), 1);
         assert.equal(f.api.getContributionState().loginWaiting, false);
+        assert.equal(f.api.getContributionState().pairCode, '');
     }
     {
         const f = fixture(); await f.prepare(); const p = assert.rejects(f.wait(), /取消/);
         f.api.cancelAutomaticLogin(); await p;
         assert.equal(f.store.size, 0); assert(f.requests.some(r => r.url.endsWith('/cancel')));
+        assert.equal(f.api.getContributionState().pairCode, '');
     }
     {
         const f = fixture(); await f.prepare(); const p = assert.rejects(f.wait(), /超时/);
@@ -113,5 +118,17 @@ function fixture() {
         await assert.rejects(f.api.prepareAutomaticLogin(USER), /无效信息/);
         assert.equal(f.api.getContributionState().autoLoginUrl, '');
     }
-    console.log('PASS: 10 automatic-login scenarios (proof binding, duplicate clicks, cancellation, timeout, account switch, late responses, stop during persistence, role/account refusal, retry bounds, URL validation).');
+    {
+        const f = fixture(); f.handlers.status = () => response({ enabled: true, loginUrl: BASE + '/auth/login', automaticLogin: true });
+        await f.prepare();
+        assert.equal(f.api.getContributionState().automaticLogin, false, 'old server cannot silently bypass pairing');
+        assert(!f.requests.some(r => r.url.endsWith('/start')));
+    }
+    {
+        const f = fixture(); await f.api.loadContributionPanel();
+        f.handlers.start = () => response({ id: 'a'.repeat(43), loginUrl: BASE + '/auth/auto/login/' + 'a'.repeat(43), pairCode: 42, expiresAt: Date.now() + 600000, intervalMs: 5000 });
+        await assert.rejects(f.api.prepareAutomaticLogin(USER), /无效信息/);
+        assert.equal(f.api.getContributionState().pairCode, '');
+    }
+    console.log('PASS: 12 automatic-login scenarios (pairing/proof binding, leading zeros, duplicate clicks, cancellation, timeout, account switch, late responses, stop during persistence, role/account refusal, retry bounds, URL validation and old-server fallback).');
 })().catch(error => { console.error(error); process.exitCode = 1; });

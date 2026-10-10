@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import uuid
@@ -16,7 +17,15 @@ from archive import ArchiveError, parse_archive, read_bounded
 @contextmanager
 def update_lock(destination):
     # Kernel locks release even if an updater crashes. The harmless lock file stays.
-    with destination.with_name(destination.name + ".lock").open("a+b") as lock:
+    lock_path = destination.with_name(destination.name + ".lock")
+    if lock_path.is_symlink():
+        raise ValueError("Update lock must not be a symlink.")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError("Update lock must be a regular file.")
+    with os.fdopen(descriptor, "r+b") as lock:
         if os.name == "nt":
             import msvcrt
             lock.seek(0)
@@ -67,6 +76,43 @@ def atomic_write(destination, raw, owner=None, mode=None):
             pass
 
 
+def _check_backup_directory(directory):
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("Backup directory must be a real directory, not a symlink or other file.")
+
+
+def _write_backup(directory, backup, raw):
+    _check_backup_directory(directory)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _check_backup_directory(directory)
+    if os.name != "posix":
+        atomic_write(backup, raw)
+        return
+    # Pin the checked directory, so a concurrent path swap cannot redirect a
+    # privileged updater's writes. O_NOFOLLOW also closes the lstat/open race.
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = "." + backup.name + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        output_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o600, dir_fd=descriptor)
+        with os.fdopen(output_fd, "wb") as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, backup.name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        os.fsync(descriptor)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=descriptor)
+        except FileNotFoundError:
+            pass
+        os.close(descriptor)
+
+
 def update_library(source, destination, backup_dir=None, initial_only=False):
     source, destination = Path(source), Path(destination)
     if source.resolve() == destination.resolve():
@@ -75,6 +121,11 @@ def update_library(source, destination, backup_dir=None, initial_only=False):
     parse_archive(raw)  # No destination, lock or backup is touched before validation.
     if destination.is_symlink():
         raise ValueError("Destination must be a regular file, not a symlink.")
+    if destination.exists() and not stat.S_ISREG(destination.lstat().st_mode):
+        raise ValueError("Destination must be a regular file.")
+    directory = Path(backup_dir) if backup_dir else destination.parent / "backups"
+    # Refuse unsafe existing paths before even creating the update lock.
+    _check_backup_directory(directory)
     backup = None
     with update_lock(destination):
         exists = destination.exists()
@@ -83,11 +134,9 @@ def update_library(source, destination, backup_dir=None, initial_only=False):
         owner = destination.stat() if exists else None
         if exists:
             previous = read_bounded(destination)
-            directory = Path(backup_dir) if backup_dir else destination.parent / "backups"
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
             backup = directory / (stamp + "-" + uuid.uuid4().hex[:8] + ".json")
-            atomic_write(backup, previous)
+            _write_backup(directory, backup, previous)
         atomic_write(destination, raw, owner)
     return backup
 
@@ -99,6 +148,8 @@ def main():
     parser.add_argument("--backup-dir", type=Path)
     parser.add_argument("--initial-only", action="store_true", help="Fail if a destination already exists.")
     args = parser.parse_args()
+    if os.name == "posix" and os.geteuid() == 0:
+        print("Warning: run library updates as the service account: sudo -u answerqr python3 -B update_library.py …", file=sys.stderr)
     try:
         backup = update_library(args.source, args.destination, args.backup_dir, args.initial_only)
     except (OSError, ValueError, ArchiveError) as exc:

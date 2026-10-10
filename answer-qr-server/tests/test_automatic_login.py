@@ -1,11 +1,13 @@
 """Automatic browser-to-plugin handoff; isolated identity and in-memory clock."""
 from concurrent.futures import ThreadPoolExecutor
+import html
 import json
+import re
 import secrets
 import unittest
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from contributions import digest, STATE_MS, AUTO_POLL_MS
+from contributions import digest, STATE_MS, AUTO_POLL_MS, MAX_LOGIN_ATTEMPTS
 import test_role_gating as roles
 from test_server import request
 
@@ -24,16 +26,25 @@ class AutomaticLoginTests(unittest.TestCase):
 
     def start(self, server, user=roles.MEMBER):
         verifier = secrets.token_urlsafe(32)
-        status, result, _ = self.api(server, "/auth/auto/start", {"challenge": digest(verifier), "userId": user})
+        status, result, _ = self.api(server, "/auth/auto/start", {"challenge": digest(verifier), "userId": user, "pairing": 1})
         self.assertEqual(status, 200)
         self.assertNotIn(verifier, json.dumps(result))
         self.assertEqual(result["intervalMs"], AUTO_POLL_MS)
         return verifier, result
 
     def browser_start(self, server, attempt):
-        status, headers, _ = request(server, path=urlsplit(attempt["loginUrl"]).path.removeprefix('/answer-qr'))
-        self.assertEqual(status, 302)
-        query = parse_qs(urlsplit(headers["Location"]).query)
+        path = urlsplit(attempt["loginUrl"]).path.removeprefix('/answer-qr')
+        status, headers, body = request(server, path=path)
+        self.assertEqual(status, 200)
+        nonce = re.search(rb'name="nonce" value="([A-Za-z0-9_-]{43})"', body)[1].decode()
+        cookie = headers['Set-Cookie'].split(';')[0]
+        status, headers, body = request(server, 'POST', path + '/confirm',
+            {'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookie},
+            urlencode({'nonce': nonce, 'code': attempt['pairCode']}).encode())
+        self.assertEqual(status, 200)
+        self.assertNotIn('Location', headers)
+        href = html.unescape(re.search(rb'id="oauth-continue" href="([^"]+)"', body)[1].decode())
+        query = parse_qs(urlsplit(href).query)
         self.assertEqual(query['scope'], ['identify guilds.members.read'])
         return query['state'][0], headers['Set-Cookie'].split(';')[0]
 
@@ -138,10 +149,10 @@ class AutomaticLoginTests(unittest.TestCase):
 
     def test_capacity_schema_cors_and_secrets_are_bounded(self):
         with self.running() as server:
-            self.assertEqual(self.api(server, '/auth/auto/start', {'challenge': 'bad', 'userId': roles.MEMBER})[0], 400)
+            self.assertEqual(self.api(server, '/auth/auto/start', {'challenge': 'bad', 'userId': roles.MEMBER, 'pairing': 1})[0], 400)
             status, headers, _ = request(server, 'OPTIONS', '/auth/auto/poll', {'Origin':'https://discord.com', 'Access-Control-Request-Method':'POST', 'Access-Control-Request-Headers':'authorization,content-type'})
             self.assertEqual(status, 204)
             with server.contributions._db() as db:
-                for i in range(1000):
+                for i in range(MAX_LOGIN_ATTEMPTS):
                     db.execute("INSERT INTO auto_logins(id,challenge,expected_user,expires,status) VALUES(?,?,?,?,'pending')", (str(i), '0'*64, roles.MEMBER, self.now+STATE_MS))
-            self.assertEqual(self.api(server, '/auth/auto/start', {'challenge':'0'*64,'userId':roles.MEMBER})[0], 429)
+            self.assertEqual(self.api(server, '/auth/auto/start', {'challenge':'0'*64,'userId':roles.MEMBER,'pairing':1})[0], 429)

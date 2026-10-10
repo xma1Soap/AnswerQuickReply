@@ -33,6 +33,8 @@ function client(data = new Map()) {
                 if (target.endsWith('/me')) return response(profile);
                 if (target.endsWith('/mine')) return response({ submissions: [{ id, title: qr.title, status: 'pending', createdAt: 1, updatedAt: 1, update }] });
                 if (fail) throw Error('connection lost after POST');
+                if (target.endsWith('/' + id)) return response({ submission: { id, title: qr.title, status: 'pending', createdAt: 1, updatedAt: 1, update, entry: { ...qr, content: 'Proposed reply' }, current: qr } });
+                if (target.endsWith('/logout-all')) return response({ revoked: 2 });
                 return response({ id, status: 'published' });
             },
             require: name => name === '@api/DataStore' ? { get: async key => structuredClone(data.get(key)), set: async (key, value) => data.set(key, structuredClone(value)) }
@@ -41,7 +43,7 @@ function client(data = new Map()) {
         return modules[name] = module.exports;
     }
     const api = load('contribute'); api.startContributions();
-    return { api, data, calls, fail: v => { fail = v; }, supports: v => { supports = v; }, url: v => { url = v; }, refreshes: () => refreshes };
+    return { api, data, calls, fail: v => { fail = v; }, reviewer: v => { profile.canReview = v; }, supports: v => { supports = v; }, url: v => { url = v; }, refreshes: () => refreshes };
 }
 const jsx = (type, props, ...children) => ({ type, props: { ...props, children } });
 const nodes = tree => Array.isArray(tree) ? tree.flatMap(nodes) : tree && typeof tree === 'object' ? [tree, ...nodes(tree.props?.children)] : [];
@@ -87,6 +89,13 @@ function ui() {
     assert.equal(reopened.refreshes(), 1);
     const record = (await reopened.api.listSubmissions())[0];
     assert.equal(record.update.targetId, qr.id);
+    const reviewed = await reopened.api.readSubmission(id);
+    assert.equal(reviewed.current.content, 'Old reply');
+    assert.equal(reviewed.entry.content, 'Proposed reply');
+    assert(Object.isFrozen(reviewed.current), 'review current snapshot is immutable');
+    reopened.reviewer(false); await reopened.api.loadContributionPanel();
+    assert.equal((await reopened.api.readSubmission(id)).current, undefined, 'client never exposes reviewer comparison to an author');
+    reopened.reviewer(true); await reopened.api.loadContributionPanel();
     const before = reopened.calls.length;
     reopened.url('https://custom.example/library.json');
     await assert.rejects(reopened.api.submitContribution(qr, update), /当前云端服务/);
@@ -115,5 +124,16 @@ function ui() {
     assert(!nodes(tree).some(n => n.type?.name === 'Button' && text(n) === '删除'), 'cloud editor never deletes local entry with same ID');
     const detail = canEditCloud => screen.detail({ entry: qr, readOnly: true, canEditCloud, onEdit() {} });
     assert(text(detail(true)).includes('编辑云端')); assert(!text(detail(false)).includes('编辑云端'));
+    const logout = client(); await logout.api.loadContributionPanel(); logout.fail(true);
+    await assert.rejects(logout.api.logoutAllContributions(), /connection lost/);
+    assert.equal(logout.data.get('AnswerQuickReply_contribution_session_v1').token, token, 'global logout can be retried when revocation is unconfirmed');
+    logout.fail(false); await logout.api.logoutAllContributions();
+    const request = logout.calls.at(-1);
+    assert(request.target.endsWith('/auth/logout-all'));
+    assert.equal(request.options.headers.Authorization, 'Bearer ' + token);
+    assert.equal(request.options.body, '{}');
+    assert.equal(logout.api.getContributionState().user, null);
+    assert.equal(logout.data.get('AnswerQuickReply_contribution_session_v1'), null);
+    logout.api.stopContributions();
     console.log('PASS: cloud edit API + actual editor regression (auth capability, exact target, idempotent retries, source isolation, pending notice, local data untouched).');
 })().catch(error => { console.error(error); process.exitCode = 1; });

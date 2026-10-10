@@ -915,6 +915,16 @@
 .aqr-contribution-images { display: flex; flex-wrap: wrap; gap: 8px; }
 .aqr-contribution-images img { max-width: 100%; max-height: 400px; object-fit: contain; border-radius: 8px; }
 .aqr-contribution-list { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+.aqr-pair-code { display: flex; flex-direction: column; gap: 8px; padding: 16px; margin: 12px 0; border: 1px solid var(--brand-500, #5865f2); border-radius: 8px; }
+.aqr-pair-code strong { font: 700 32px/1.2 var(--font-code, monospace); letter-spacing: .3em; }
+.aqr-review-diff { overflow-x: auto; margin: 12px 0; }
+.aqr-review-diff table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.aqr-review-diff th, .aqr-review-diff td { border: 1px solid var(--background-modifier-accent); padding: 8px; overflow-wrap: anywhere; white-space: pre-wrap; text-align: left; }
+.aqr-review-diff tr.is-changed { background: var(--background-modifier-hover); }
+.aqr-review-lines { max-height: 400px; overflow: auto; font-family: var(--font-code, monospace); }
+.aqr-diff-line { white-space: pre-wrap; overflow-wrap: anywhere; padding: 2px 8px; }
+.aqr-diff-line.is-removed { background: rgb(242 63 67 / .16); border-inline-start: 3px solid var(--status-danger, #f23f43); }
+.aqr-diff-line.is-added { background: rgb(35 165 90 / .16); border-inline-start: 3px solid var(--status-positive, #23a55a); }
 
 /* This notice is a sibling of Discord's React root, so it owns its styling. */
 .aqr-toast-host {

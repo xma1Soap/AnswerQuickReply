@@ -7,8 +7,9 @@
 import { RenderModalProps } from "@vencord/discord-types";
 import { Modal, openModal, useEffect, useRef, UserStore, useState } from "@webpack/common";
 
-import { cancelAutomaticLogin, exchangeLoginCode, getContributionState, listSubmissions, loadContributionPanel, logoutContributions, prepareAutomaticLogin, readSubmission, reviewSubmission, snapshotContribution, Submission, SubmissionDetail, submitContribution, subscribeContributions, waitForAutomaticLogin } from "./contribute";
+import { cancelAutomaticLogin, exchangeLoginCode, getContributionState, listSubmissions, loadContributionPanel, logoutAllContributions, logoutContributions, prepareAutomaticLogin, readSubmission, reviewSubmission, snapshotContribution, Submission, SubmissionDetail, submitContribution, subscribeContributions, waitForAutomaticLogin } from "./contribute";
 import { QREntry } from "./model";
+import { diffLines } from "./reviewDiff";
 
 const statusName = { pending: "待审核", published: "已发布", rejected: "已驳回" };
 
@@ -25,6 +26,26 @@ function ContributionPreview({ entry }: { entry: QREntry; }) {
         <div className="aqr-contribution-images">{entry.images.map(image => <img key={image.id} src={image.dataUrl} alt={image.name} />)}</div>
         <p>触发词：{entry.keywords.join("、") || "无"}</p><p>辅助词：{entry.weakKeywords.join("、") || "无"}</p>
     </article>;
+}
+
+function ContributionComparison({ current, entry }: { current: QREntry | null; entry: QREntry; }) {
+    if (!current) return <p className="aqr-banner is-danger">原云端条目已不存在，无法对比；系统会阻止这条修改覆盖。</p>;
+    const fields = [
+        ["标题", current.title, entry.title], ["触发词", current.keywords.join("、"), entry.keywords.join("、")],
+        ["辅助词", current.weakKeywords.join("、"), entry.weakKeywords.join("、")],
+        ["图片数量", String(current.images.length), String(entry.images.length)], ["来源链接", current.sourceUrl ?? "", entry.sourceUrl ?? ""]
+    ];
+    return <section className="aqr-review-diff" aria-label="云端修改前后对比">
+        <h3>修改前后对比</h3>
+        <table><thead><tr><th>字段</th><th>当前云端</th><th>申请修改为</th></tr></thead>
+            <tbody>{fields.map(([label, before, after]) => <tr key={label} className={before === after ? "" : "is-changed"}>
+                <th>{label}</th><td>{before || "无"}</td><td>{after || "无"}</td>
+            </tr>)}</tbody></table>
+        <h4>正文（− 删除，＋ 新增）</h4>
+        <div className="aqr-review-lines">{diffLines(current.content, entry.content).map((line, index) => <div key={index} className={`aqr-diff-line is-${line.kind}`}>
+            <span aria-label={line.kind === "removed" ? "删除" : line.kind === "added" ? "新增" : "保留"}>{line.kind === "removed" ? "− " : line.kind === "added" ? "＋ " : "  "}</span>{line.text || "\u00a0"}
+        </div>)}</div>
+    </section>;
 }
 
 function ContributionPanel({ modalProps, draft }: { modalProps: RenderModalProps; draft?: QREntry; }) {
@@ -72,8 +93,9 @@ function ContributionPanel({ modalProps, draft }: { modalProps: RenderModalProps
             {!service.ready ? <p>{busy ? "正在检查贡献服务…" : "暂时无法读取贡献服务状态。"}</p>
                 : !service.enabled ? <p className="aqr-banner is-info">管理员尚未开通 Discord 登录，社区云端库与投稿暂不可用；本地 QR 不受影响。</p>
                     : !service.user ? <section className="aqr-remote-connection">
-                        <p>在浏览器授权当前 Discord 账号，完成后插件会自动登录，无需复制登录码。授权只读取用户名和答疑服务器中的身份组。</p>
+                        <p>从本面板打开浏览器，输入本面板的配对码后授权当前 Discord 账号。完成后插件会自动登录。请勿打开别人发来的登录链接或输入别人提供的配对码。</p>
                         {service.automaticLogin && <>
+                            {service.pairCode && <div className="aqr-pair-code" role="status"><span>在浏览器里输入这个配对码</span><strong>{service.pairCode}</strong><small>只在你自己刚打开的授权页面输入；输错一次，本次登录作废。</small></div>}
                             {service.autoLoginUrl ? <a className="aqr-btn aqr-btn--primary" href={service.autoLoginUrl} target="_blank" rel="noopener noreferrer" onClick={e => {
                                 if (running.current) { e.preventDefault(); return; }
                                 void run(async () => {
@@ -84,7 +106,7 @@ function ContributionPanel({ modalProps, draft }: { modalProps: RenderModalProps
                             }}>{service.loginWaiting ? "正在等待浏览器授权…" : "使用 Discord 登录"}</a>
                                 : <button type="button" className="aqr-btn" disabled={busy} onClick={() => void run(() => refresh(false))}>准备登录</button>}
                             {service.loginWaiting && <div role="status">
-                                <p>请在浏览器完成授权，保留此面板。授权后通常 5 秒内登录。</p>
+                                <p>请在浏览器输入上方配对码并完成授权，保留此面板。授权后通常 5 秒内登录。</p>
                                 <a className="aqr-link" href={service.autoLoginUrl} target="_blank" rel="noopener noreferrer">重新打开授权页面</a>
                                 <button type="button" className="aqr-btn" onClick={cancelAutomaticLogin}>取消登录</button>
                             </div>}
@@ -100,10 +122,13 @@ function ContributionPanel({ modalProps, draft }: { modalProps: RenderModalProps
                         <small>不读取 Discord 客户端 token。贡献会话只保存在本机，不进入 QR 备份。</small>
                     </section> : <>
                         <div className="aqr-remote-actions">
-                            <span>已登录：{service.user.username}{service.libraryAccess === "denied" ? " · 没有答疑身份组，云端库不可用" : ""}</span>
+                            <span>已登录：{service.user.username}{service.libraryAccess === "denied" ? " · 没有答疑身份组，云端库不可用" : ""}{service.expiresAt > 0 ? ` · 会话到期：${new Date(service.expiresAt).toLocaleString()}` : ""}</span>
                             <button type="button" className="aqr-btn" disabled={busy} onClick={() => void run(async () => {
                                 await logoutContributions(); if (mounted.current) { setItems([]); setDetail(null); setCode(""); setNotice("已退出贡献服务。"); }
                             })}>退出登录</button>
+                            <button type="button" className="aqr-btn" disabled={busy} onClick={() => void run(async () => {
+                                await logoutAllContributions(); if (mounted.current) { setItems([]); setDetail(null); setCode(""); setNotice("已退出所有设备，其他设备需要重新登录。"); }
+                            })}>退出所有设备</button>
                         </div>
                         {draft && !submitted && <section>
                             <p>请核对将提交的文字、图片和关键词。{service.canAutoPublish ? "服务授予当前账号免审权限，提交后可直接发布。" : "提交后由管理员审核，通过才会进入云端库。"}</p>
@@ -126,6 +151,7 @@ function ContributionPanel({ modalProps, draft }: { modalProps: RenderModalProps
                         {detail && <section>
                             <p>{statusName[detail.status]}{detail.submitterId ? ` · 提交者 ${detail.submitterId}` : ""}</p>
                             {detail.update && <p className="aqr-banner is-info">这是一条云端修改申请，通过后替换原条目，不新增 QR。{detail.status === "pending" ? "审核前原内容仍可使用；若原条目已更新，系统会阻止旧修改覆盖。" : ""}</p>}
+                            {service.canReview && detail.update && detail.current !== undefined && <ContributionComparison current={detail.current} entry={detail.entry} />}
                             <ContributionPreview entry={detail.entry} />
                             {detail.reason && <p>审核说明：{detail.reason}</p>}
                             {review && service.canReview && detail.status === "pending" && <>

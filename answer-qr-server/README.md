@@ -55,7 +55,7 @@ CORS 只允许以下完整 Origin，未知 Origin 返回 `403` 且不反射：
 # 只在账号不存在时创建；这不是 root 运行的服务。
 id answerqr >/dev/null 2>&1 || sudo useradd --system --home-dir /var/lib/answer-qr --shell /usr/sbin/nologin answerqr
 sudo install -d -m 0755 /opt/answer-qr/releases
-sudo install -d -m 0750 -o root -g answerqr /var/lib/answer-qr
+sudo install -d -m 0700 -o answerqr -g answerqr /var/lib/answer-qr
 
 # 每个版本放独立目录，保留旧版本。RELEASE 由管理员选择唯一名称。
 RELEASE=2026-10-09-01
@@ -67,7 +67,7 @@ cd "/opt/answer-qr/releases/$RELEASE"
 python3 -B -m unittest discover -s tests -v
 
 # 初始化拒绝覆盖已有文件；有库时跳过这一条。
-sudo python3 -B update_library.py initial-library.json --destination /var/lib/answer-qr/library.json --initial-only
+sudo -u answerqr python3 -B update_library.py initial-library.json --destination /var/lib/answer-qr/library.json --initial-only
 sudo chown answerqr:answerqr /var/lib/answer-qr/library.json
 sudo chmod 0600 /var/lib/answer-qr/library.json
 
@@ -82,7 +82,7 @@ sudo systemctl enable --now answer-qr.service
 curl --fail http://127.0.0.1:8765/readyz
 ```
 
-账号 `answerqr` 读取服务代码与库，并写入数据目录中的 SQLite（会话、身份组缓存、下载审计、投稿队列）。systemd 模板将其余文件系统设为只读，只开放 `ReadWritePaths=/var/lib/answer-qr`；管理员更新脚本由 root 单独运行。
+账号 `answerqr` 读取服务代码与库，并写入数据目录中的 SQLite（会话、身份组缓存、下载审计、投稿队列）。systemd 模板将其余文件系统设为只读，只开放 `ReadWritePaths=/var/lib/answer-qr`；整库更新和会话撤销也统一以 `sudo -u answerqr` 执行。OAuth/Bot 配置工具须由 root 管理配置文件，token 只通过隐藏输入录入。
 
 把 `deploy/nginx-location.conf` 的**单个 location** 放进现有 HTTPS `server` 内，或者通过该 `server` 内的独立 `include` 引用。不要新建同域名冲突 server，也不要覆盖证书配置。CORS 与认证由 Python 处理，不要在该 location 再加 `Access-Control-Allow-Origin: *`。修改前备份站点配置，并确认改的是实际生效的 HTTPS server。
 
@@ -110,16 +110,19 @@ limit_req_status 429;
 
 1. 在桌面或手机插件里管理自己的 QR，并点“导出备份”。服务器初始库为空，**不会自动收集或上传本地 QR**。
 2. 管理员把准备发布的导出 JSON，通过自己使用的 SCP/SFTP 上传到 VPS 暂存目录。读取接口没有上传能力；上传使用已有管理通道的权限。
-3. 在当前 VPS 的 root SSH 终端运行下面的更新脚本。脚本保留库文件原来的属主，服务继续只读。不要直接覆盖正在服务的 `library.json`。
+3. 在当前 VPS 的 SSH 终端以服务账号运行下面的更新脚本。脚本保留库文件原来的属主。不要直接覆盖正在服务的 `library.json`。
 
 ```sh
 # 假设管理员上传到了 /tmp/answer-qr-upload.json；先核对文件来源。
 chmod 600 /tmp/answer-qr-upload.json
-python3 -B /opt/answer-qr/current/update_library.py /tmp/answer-qr-upload.json --destination /var/lib/answer-qr/library.json
+sudo chown answerqr:answerqr /tmp/answer-qr-upload.json
+sudo -u answerqr python3 -B /opt/answer-qr/current/update_library.py /tmp/answer-qr-upload.json --destination /var/lib/answer-qr/library.json
 curl --fail http://127.0.0.1:8765/readyz
 ```
 
-脚本先校验新文件，通过后取得更新锁，把旧文件备份到 `/var/lib/answer-qr/backups/`，再在目标文件同一目录创建临时文件、同步内容并原子替换。新文件无效时不碰旧库或备份；替换失败时保留旧库和已成功写下的备份。多次更新自动保留各自备份，不自动删除历史库。更新时间文件名采用 UTC。
+脚本先校验新文件，通过后取得更新锁，把旧文件备份到 `/var/lib/answer-qr/backups/`，再在目标文件同一目录创建临时文件、同步内容并原子替换。锁文件以 `O_NOFOLLOW` 打开，备份目录以 `lstat` 检查；符号链接或非普通目录会被拒绝，Linux 上还固定目录描述符以防检查后的路径替换。新文件无效时不碰旧库或备份；替换失败时保留旧库和已成功写下的备份。多次更新自动保留各自备份，不自动删除历史库。更新时间文件名采用 UTC。root 直接执行时会打印改用服务账号的警告。
+
+若已有 `backups/` 是 root 私有目录，不改变旧备份权限；给更新命令加 `--backup-dir /var/lib/answer-qr/service-backups`，让服务账号在自己的数据目录创建新的普通备份目录。恢复 root 私有历史备份时，先由管理员把选定文件复制到 `answerqr` 可读的暂存文件，再用同一更新脚本恢复。
 
 更新后各客户端需手动刷新共享源。修改本地 QR 不会自动上传；贡献扩展只有用户主动提交后才进入审核或免审发布流程。管理员的备份与上传暂存文件由管理员决定保留策略，更新脚本不代删；贡献扩展自己的自动发布备份另有容量限制。
 
@@ -128,13 +131,15 @@ curl --fail http://127.0.0.1:8765/readyz
 数据回滚也使用同一个校验和原子更新脚本；把下例文件名替换成已检查的备份。回滚前的当前库会再生成一份备份：
 
 ```sh
-python3 -B /opt/answer-qr/current/update_library.py /var/lib/answer-qr/backups/CHOSEN_BACKUP.json --destination /var/lib/answer-qr/library.json
+sudo -u answerqr python3 -B /opt/answer-qr/current/update_library.py /var/lib/answer-qr/backups/CHOSEN_BACKUP.json --destination /var/lib/answer-qr/library.json
 curl --fail http://127.0.0.1:8765/readyz
 ```
 
 每次更新代码之前记下 `readlink /opt/answer-qr/current`，保留旧 release、旧 systemd unit 和将要修改的 Nginx 配置副本。新代码上传到另一个 release 目录，先运行测试，然后以 `current.new` + `mv -Tf` 切换链接并 `sudo systemctl restart answer-qr`。**不要重新初始化库**。若服务检查失败，把链接切回旧 release，再重启此服务；若修改了 unit，恢复对应旧副本后 `daemon-reload`，并核对库的访问模式（身份组 / 读密钥 / 公开）是否符合当前要求；Nginx 仅在恢复所改片段且 `nginx -t` 成功后 reload。代码升级/回滚不改 `/var/lib/answer-qr/library.json`。
 
 数据替换依赖同一文件系统上的 `os.replace`，不是先删旧文件再写入；参见 [Python 原子替换说明](https://docs.python.org/3/library/os.html#os.replace)。Windows 可运行多数本地测试，但正被其他进程打开的文件可能导致替换失败；实际部署与并发读取保证面向 Linux/POSIX。
+
+本次鉴权安全升级的配对登录、旧会话撤销、SQLite 一致性备份、仅针对本项目的 Nginx 限流与部署前确认，见 [SECURITY-DEPLOYMENT.md](SECURITY-DEPLOYMENT.md)。线上验证通过前不要把安全修复推送到公开仓库。
 
 ## 测试
 

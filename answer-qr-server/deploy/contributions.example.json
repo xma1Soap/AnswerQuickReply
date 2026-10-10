@@ -6,6 +6,8 @@
   "libraryRoleIds": ["YOUR_ANSWER_ROLE_ID"],
   "botToken": "",
   "libraryReadsPerHour": 60,
+  "roleProofHours": 24,
+  "publishesPerHour": 30,
   "reviewerIds": ["YOUR_DISCORD_USER_ID"],
   "autoPublishIds": [],
   "databasePath": "/var/lib/answer-qr/contributions.sqlite3"
